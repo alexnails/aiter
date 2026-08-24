@@ -1057,7 +1057,7 @@ def _parse_args():
         type=str,
         choices=["none", "mxfp8"],
         default=os.environ.get("COMBINE_QUANT", "none"),
-        help="combine wire dtype for scatter_fused: none (bf16) | mxfp8 "
+        help="combine wire dtype for the fused combine: none (bf16) | mxfp8 "
         "(fp8 e4m3 payload + per-1x32 e8m0 scale). Falls back to $COMBINE_QUANT.",
     )
     p.add_argument(

@@ -711,8 +711,10 @@ def launch_gemm_a8w4_tdm(
         # activations: 4 is safe for both, 16 costs 2.5%; 2..8 is within noise.
         MMA_GROUP = 4
         # WMMA held back as a closing pure-MFMA group, covering the next k128's
-        # REUSE fence; the prefetch reads interleave evenly over the rest.
-        FENCE_COVER_MMA = 8
+        # REUSE fence; the prefetch reads interleave evenly over the rest. Narrow
+        # tiles can have n_acc as low as the tail itself, so clamp it to keep at
+        # least one group for the interleaved part.
+        FENCE_COVER_MMA = min(8, max(0, n_acc - MMA_GROUP))
 
         def mma_rows(wm_list, act, wt, sa_k, sb_k):
             for i in range_constexpr(len(wm_list)):

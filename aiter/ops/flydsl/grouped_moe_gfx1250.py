@@ -122,6 +122,7 @@ def _find_grouped_config(
     q_dtype_a,
     q_dtype_w,
     quant_type,
+    ep_fused: bool = False,
 ):
     from aiter.jit.utils.chip_info import get_cu_num
 
@@ -138,6 +139,9 @@ def _find_grouped_config(
         "q_dtype_a": str(q_dtype_a),
         "q_dtype_w": str(q_dtype_w),
         "q_type": _enum_name(quant_type),
+        # gemm2 also does the EP scatter, which shifts the stage2 tile optimum
+        # away from the plain-GEMM one. Rows leaving this blank serve both paths.
+        "ep_fused": "1" if ep_fused else "0",
     }
     rows = _load_grouped_config_rows()
 
@@ -145,17 +149,30 @@ def _find_grouped_config(
     # constraint, while cu_num can be relaxed as a fallback. Columns missing from
     # the CSV (e.g. older configs without a 'gfx' column) are skipped, so this
     # stays backward compatible with pre-gfx tuned files.
+    # The tuner rewrites its frame through ``astype(str)``, so a blank cell can
+    # come back as the literal "nan"; read those as unset (wildcard) instead of
+    # as a value that matches nothing.
+    def _cell(row, k):
+        value = str(row.get(k) or "").strip()
+        return "" if value.lower() in ("nan", "none") else value
+
     def _matches(row, *, require_cu_num: bool):
         for k, v in keys.items():
             if k == "cu_num" and not require_cu_num:
                 continue
-            if row.get(k) and str(row.get(k)).strip() != v:
+            cell = _cell(row, k)
+            if cell and cell != v:
                 return False
         return True
 
     matches = [row for row in rows if _matches(row, require_cu_num=True)]
     if not matches:
         matches = [row for row in rows if _matches(row, require_cu_num=False)]
+    # A row that names ep_fused explicitly was tuned for that path, so it wins
+    # over an otherwise equal row that serves both.
+    ep_specific = [row for row in matches if _cell(row, "ep_fused")]
+    if ep_specific:
+        matches = ep_specific
     if not matches:
         if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
             "",
@@ -1036,6 +1053,7 @@ def grouped_gemm_gfx1250_a8w4(
         q_dtype_a=q_dtype_a,
         q_dtype_w=q_dtype_w_key,
         quant_type=quant_type,
+        ep_fused=stage2_scatter is not None,
     )
     if cfg_row is not None:
         tile_m = _as_int(cfg_row.get("tile_m"), tile_m)
