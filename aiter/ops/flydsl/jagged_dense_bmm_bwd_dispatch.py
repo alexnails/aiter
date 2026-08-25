@@ -47,9 +47,9 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Optional
 
 import torch
+from flydsl.runtime.device import get_rocm_arch
 
 from .kernels import jagged_dense_bmm_bwd as _bwd
 
@@ -72,7 +72,7 @@ _SCHEMA_DEFAULTS = {
     "gj_stages_a": None,  # None -> heuristic (1 if D<=256 else 2)
 }
 
-_DISPATCH_TABLE: Optional[dict] = None
+_DISPATCH_TABLE: dict | None = None
 
 
 def _dispatch_json_paths() -> tuple[Path, ...]:
@@ -82,21 +82,16 @@ def _dispatch_json_paths() -> tuple[Path, ...]:
     return (Path(__file__).resolve().parent / "jagged_dense_bmm_bwd_dispatch.json",)
 
 
-def _detect_arch() -> Optional[str]:
+def _detect_arch() -> str | None:
     """Detected ROCm arch (e.g. ``gfx942``), or None. Shares the forward's arch
     override env so a test can target a non-native table."""
     env = os.environ.get("FLYDSL_JAGGED_DENSE_BMM_ARCH")
     if env:
         return env
-    try:
-        from flydsl.runtime.device import get_rocm_arch
-
-        return get_rocm_arch()
-    except Exception:
-        return None
+    return get_rocm_arch()
 
 
-def _select_arch_section(data: dict, arch: Optional[str]) -> dict:
+def _select_arch_section(data: dict, arch: str | None) -> dict:
     """Pick the per-arch sub-table from an ``arch-keyed-v1`` JSON; a flat (legacy)
     JSON is returned as-is (matches the forward loader)."""
     by_arch = data.get("by_arch")
@@ -172,9 +167,9 @@ def resolve_config(
     reduction_k: int,
     output_n: int,
     max_seq_len: int,
-    split: Optional[int] = None,
-    coarsen_m: Optional[int] = None,
-    gj_stages_a: Optional[int] = None,
+    split: int | None = None,
+    coarsen_m: int | None = None,
+    gj_stages_a: int | None = None,
 ) -> dict:
     """Full schedule config for a shape: explicit kwarg > table winner > heuristic.
 
@@ -244,13 +239,13 @@ def jagged_dense_bmm_bwd_dispatched(
     dense: torch.Tensor,  # (n_groups, K, N) bf16
     d_out: torch.Tensor,  # (L, N)          bf16, upstream gradient
     seq_offsets: torch.Tensor,  # (n_groups + 1,) int32, prefix-sum row offsets
-    n_groups: Optional[int] = None,
-    max_seq_len: Optional[int] = None,
+    n_groups: int | None = None,
+    max_seq_len: int | None = None,
     stream=None,
     *,
-    split: Optional[int] = None,
-    gj_stages_a: Optional[int] = None,
-    coarsen_m: Optional[int] = None,
+    split: int | None = None,
+    gj_stages_a: int | None = None,
+    coarsen_m: int | None = None,
 ):
     """Dispatched backward: returns ``(d_jagged, d_dense, d_bias)``.
 

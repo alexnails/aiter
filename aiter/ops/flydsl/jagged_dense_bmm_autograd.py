@@ -31,8 +31,6 @@ CONSTRAINTS (inherited from the backward):
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 
 from .jagged_dense_bmm_bwd_dispatch import jagged_dense_bmm_bwd_dispatched
@@ -128,8 +126,8 @@ def jagged_dense_bmm_autograd(
     dense: torch.Tensor,  # (n_groups, K, N) bf16 weight (requires_grad ok)
     bias: torch.Tensor,  # (n_groups, N)    bf16 bias   (requires_grad ok)
     seq_offsets: torch.Tensor,  # (n_groups + 1,)  int32 prefix-sum offsets
-    n_groups: Optional[int] = None,
-    max_seq_len: Optional[int] = None,
+    n_groups: int | None = None,
+    max_seq_len: int | None = None,
     stream=None,
     uniform_seqlen: bool = True,
 ):

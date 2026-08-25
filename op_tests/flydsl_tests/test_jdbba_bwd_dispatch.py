@@ -62,7 +62,7 @@ _HEADLINE = [
     (1024, 512, "skew"),
 ]
 # grad_jagged last-group tail over-read regression (must keep exact shape/seed).
-_REGRESSION = dict(B=32, Mi=2048, regime="genrec", seed=1234, sparsity=0.95)
+_REGRESSION = {"B": 32, "Mi": 2048, "regime": "genrec", "seed": 1234, "sparsity": 0.95}
 _COS_THRESH = 0.999
 
 
@@ -94,11 +94,11 @@ def _eager_grads(jagged, dense, bias, seq_offsets, grad_out, B):
 def _run_autograd_case(D, B, Mi, regime, *, seed=1234, sparsity=0.95):
     """Run the fwd+bwd autograd op through out.backward(); check grads vs eager."""
     import torch
-
-    from aiter.ops.flydsl import jagged_dense_bmm_autograd
     from bench_jagged_dense_bmm_bwd_perf import _make_inputs
 
-    jagged, dense, grad_out, seq_offsets, L, N, K = _make_inputs(
+    from aiter.ops.flydsl import jagged_dense_bmm_autograd
+
+    jagged, dense, grad_out, seq_offsets, L, N, _K = _make_inputs(
         B, D, D, Mi, regime=regime, seed=seed, sparsity=sparsity
     )
     bias = torch.randn(B, N, dtype=torch.bfloat16, device=jagged.device)
@@ -124,12 +124,12 @@ def _run_case(D, B, Mi, regime, *, seed=1234, sparsity=0.95, label=""):
     """Run the dispatched backward for one shape; return (ok, msg)."""
     import torch
 
+    # Reuse the bench's input builder + eager reference (single source of truth).
+    from bench_jagged_dense_bmm_bwd_perf import _make_inputs, _torch_reference
+
     from aiter.ops.flydsl import jagged_dense_bmm_bwd_dispatched
     from aiter.ops.flydsl.jagged_dense_bmm_bwd_dispatch import resolve_config
     from aiter.ops.flydsl.kernels import jagged_dense_bmm_bwd as _bwd
-
-    # Reuse the bench's input builder + eager reference (single source of truth).
-    from bench_jagged_dense_bmm_bwd_perf import _make_inputs, _torch_reference
 
     jagged, dense, d_out, seq_offsets, L, N, K = _make_inputs(
         B, D, D, Mi, regime=regime, seed=seed, sparsity=sparsity
@@ -169,9 +169,9 @@ def _run_reduce_path_case(D, B, Mi, regime, *, seed=1234, sparsity=0.95):
     guarding the reduce kernels' col < N store bound.
     """
     import torch
+    from bench_jagged_dense_bmm_bwd_perf import _make_inputs, _torch_reference
 
     from aiter.ops.flydsl import jagged_dense_bmm_bwd_dispatched
-    from bench_jagged_dense_bmm_bwd_perf import _make_inputs, _torch_reference
 
     jagged, dense, d_out, seq_offsets, L, N, K = _make_inputs(
         B, D, D, Mi, regime=regime, seed=seed, sparsity=sparsity
@@ -183,7 +183,7 @@ def _run_reduce_path_case(D, B, Mi, regime, *, seed=1234, sparsity=0.95):
     rj, rd, rb = _torch_reference(jagged, dense, d_out, seq_offsets, N, K)
     c_dj, c_dd, c_db = _cos(dj, rj), _cos(dd, rd), _cos(db, rb)
     ok = min(c_dj, c_dd, c_db) > _COS_THRESH
-    ncols = (N + (N if N <= 256 else 256) - 1) // (N if N <= 256 else 256)
+    ncols = (N + (min(N, 256)) - 1) // (min(N, 256))
     tag = f"[reduce-path] B={B} D={D} Mi={Mi} {regime:6s} split=2 NRED_COL_TILES={ncols} L={L}"
     return (
         ok,
@@ -291,13 +291,13 @@ def _orchestrate() -> int:
 
 def _backend_ready() -> bool:
     """True iff a ROCm/CUDA device and an importable flydsl are both present."""
+    from aiter.ops.flydsl.utils import is_flydsl_available
+
     try:
         import torch
 
-        from aiter.ops.flydsl import is_flydsl_available
-
         return torch.cuda.is_available() and is_flydsl_available()
-    except Exception:
+    except ImportError:
         return False
 
 

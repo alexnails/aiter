@@ -47,7 +47,7 @@ except ImportError:  # bare sibling import (kernels dir on sys.path[0])
 BLOCK_K = _fwd.BLOCK_K
 BLOCK_M = _fwd.BLOCK_M
 BLOCK_N = _fwd.BLOCK_N
-STAGES_A = _fwd.STAGES_A  # noqa: F401  (reference value for GJ_STAGES_A below)
+STAGES_A = _fwd.STAGES_A
 make_bounded_buffer_tensor = _fwd.make_bounded_buffer_tensor
 
 # --- D-INDEPENDENT constants (module-level; the kernels snapshot these as fixed
@@ -102,6 +102,8 @@ DDENSE_NROW_GROUPS = DDENSE_THREADS // DDENSE_BN
 COARSEN_M = 2
 GJ_STAGES_A = 1
 
+_DEFAULT_STREAM = fx.Stream(None)
+
 
 def _split_for(D):
     """Default SPLIT over the jagged (m) axis for the dDense / dBias reductions.
@@ -143,7 +145,7 @@ Backward = collections.namedtuple(
 # distinct (D, split, gj_stages_a, coarsen_m) tuples a process actually launches
 # (typically 1-2 D x a couple of knob sets), and each entry is a set of compiled
 # kernels we WANT to keep resident for the process lifetime. No eviction needed.
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
     """Build (and memoize) the backward launchers specialized to this (D, knobs).
 
@@ -167,7 +169,7 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
     # D-derived compile-time constants (closure locals baked into the kernels).
     K = N = D
     SPLIT = _split_for(D) if split is None else int(split)
-    NRED_BLK = N if N <= 256 else 256
+    NRED_BLK = min(N, 256)
     # NRED_COL_TILES > 1 when N > NRED_BLK; the last tile may be partial (N not a
     # multiple of NRED_BLK, e.g. a forced split=2 at D=384). The reduce kernels
     # guard col < N, so a partial last tile is correct -- no divisibility gate is
@@ -177,10 +179,8 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
     NRED_TILES = N // BLOCK_K  # contraction tiles over N
     NK_TILES = K // DDENSE_BK  # dDense output K-tiles per group
     NN_TILES = N // DDENSE_BN  # dDense output N-tiles per group
-    COARSEN_M = COARSEN_M_default if coarsen_m is None else int(coarsen_m)  # noqa: F821
-    GJ_STAGES_A = (
-        GJ_STAGES_A_default if gj_stages_a is None else int(gj_stages_a)
-    )  # noqa: F821
+    COARSEN_M = COARSEN_M_default if coarsen_m is None else int(coarsen_m)
+    GJ_STAGES_A = GJ_STAGES_A_default if gj_stages_a is None else int(gj_stages_a)
 
     @flyc.kernel
     def grad_jagged_kernel(
@@ -321,7 +321,27 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
                 gA_k_stride = fx.get_scalar(gA_k.stride[2])
                 gB_k_stride = fx.get_scalar(gB_k.stride[2])
 
-                def run_pipeline_stage(read_stage, next_k, read_next=True):
+                def run_pipeline_stage(
+                    read_stage,
+                    next_k,
+                    read_next=True,
+                    *,
+                    buffer_copy_128b=buffer_copy_128b,
+                    thr_gA_k=thr_gA_k,
+                    copy_frag_A=copy_frag_A,
+                    gA_k_stride=gA_k_stride,
+                    thr_gB_k=thr_gB_k,
+                    mma_frag_B_retile=mma_frag_B_retile,
+                    gB_k_stride=gB_k_stride,
+                    uni_copy_128b=uni_copy_128b,
+                    thr_sA_s2r=thr_sA_s2r,
+                    mma_frag_A_retile=mma_frag_A_retile,
+                    tiled_mma=tiled_mma,
+                    mma_frag_C=mma_frag_C,
+                    mma_frag_A=mma_frag_A,
+                    mma_frag_B=mma_frag_B,
+                    thr_sA=thr_sA,
+                ):
                     write_stage = read_stage ^ 1
                     # B stays register-double-buffered (no LDS cost) on read/write_stage.
                     # A's LDS stage folds modulo GJ_STAGES_A: 2 stages ping-pong across
@@ -412,7 +432,7 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
         SEQ_OFFSETS: fx.Tensor,  # (n_groups + 1,) int32
         n_groups: int,
         max_seq_len: int,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = _DEFAULT_STREAM,
     ):
         """dJagged[s:e, :] = dOut[s:e, :] @ Dense[b].T, per group.
 
@@ -780,7 +800,7 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
         bias_partials: fx.Tensor,  # fp32 scratch (n_groups * SPLIT, N)
         n_groups: int,
         max_seq_len: int,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = _DEFAULT_STREAM,
     ):
         """dDense[b] = Jagged[s:e, :].T @ dOut[s:e, :] and dBias[b] = sum_m dOut[s:e, :].
 
@@ -863,7 +883,7 @@ GJ_STAGES_A_default = GJ_STAGES_A
 K = getattr(_fwd, "K", BLOCK_N)
 N = getattr(_fwd, "N", BLOCK_N)
 SPLIT = _split_for(K)
-_active: "Backward | None" = None
+_active: Backward | None = None
 
 
 def configure_dim(D):
@@ -889,7 +909,6 @@ def configure_dim(D):
 
 
 def _ensure_active():
-    global _active
     if _active is None:
         configure_dim(K)
     return _active
