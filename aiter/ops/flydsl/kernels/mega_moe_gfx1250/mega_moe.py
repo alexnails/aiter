@@ -35,9 +35,10 @@ _COMBINE_CHUNK_BYTES = 384
 # block than the bf16 one.
 #
 # C=1 is what matters; T only sets the tile height. Now that the reduce
-# double-buffers its input tile, the iteration count barely registers -- T=32
-# measures the same 89us as T=16 at 16k tokens/rank despite halving the trip
-# count. C, on the other hand, decides the LDS read pattern: C=4 makes a wave
+# double-buffers both tiles, the iteration count barely registers -- T=32
+# measured the same 89us as T=16 at 16k tokens/rank despite halving the trip
+# count, and it no longer fits the LDS budget anyway (176KB with two tiles a
+# side). C, on the other hand, decides the LDS read pattern: C=4 makes a wave
 # straddle two chunks and costs 24us (T=4/C=4 measures 113us at the same T*C, so
 # the same LDS footprint and lane count).
 _COMBINE_TOKENS_PER_BLOCK = 16
@@ -591,19 +592,15 @@ class MegaMoEGfx1250:
             }
 
         # Keep the cross-device barrier in its own 1-block kernel so the reduce
-        # grid is unconstrained. 512x16 measured best-or-tied at every token count.
-        # The MXFP8 path stages through LDS, so its block is sized to the lane
-        # tile (T*C*256/16 lanes) rather than to the bf16 sweet spot.
-        if config.combine_quant_fp8:
-            _lanes = (
-                _COMBINE_TOKENS_PER_BLOCK
-                * _COMBINE_CHUNKS_PER_ITER
-                * _COMBINE_CHUNK_ELEMS
-                // 16
-            )
-            combine_specs = [(512, _lanes // _WAVE_SIZE)]
-        else:
-            combine_specs = [(512, 16)]
+        # grid is unconstrained. Both wires stage through LDS, so the block is
+        # sized to the lane tile (T*C*256/16 lanes).
+        _lanes = (
+            _COMBINE_TOKENS_PER_BLOCK
+            * _COMBINE_CHUNKS_PER_ITER
+            * _COMBINE_CHUNK_ELEMS
+            // 16
+        )
+        combine_specs = [(512, _lanes // _WAVE_SIZE)]
         self._combine_specs = combine_specs
         self._combine_variants = {
             spec: _make_combine_fused_reduce(
