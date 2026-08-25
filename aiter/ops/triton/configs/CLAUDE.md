@@ -124,8 +124,6 @@ Consequences to keep in mind:
 
 Direct-path loaders bypass the resolver's directory probe. Grep for
 `f"{AITER_TRITON_CONFIGS_PATH}/..."` before moving anything.
-`gluon/gemm_afp4wfp4.py` goes through `get_gemm_config(backend="gluon")` and
-needs no changes.
 
 ---
 
