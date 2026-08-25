@@ -29,14 +29,17 @@ _COMBINE_QUANT_MODES = ("none", "mxfp8")
 # MXFP8 combine wire chunk, kept in sync with the gemm2 scatter epilogue and
 # the combine reduce kernel.
 _COMBINE_CHUNK_ELEMS = 256
-_COMBINE_CHUNK_BYTES = 272
+_COMBINE_CHUNK_BYTES = 384
 # Lane tile for the TDM combine: T tokens x C chunks per block iteration. The
-# reduce needs T*C*256/16 lanes, which is why the quantized path runs a
-# narrower block than the bf16 one. Wide-T tiles win: at 16k tokens/rank the
-# reduce measures 212us at T=2/C=4, 148us at T=4/C=4 and 118us at T=16/C=1,
-# since a taller tile amortizes the per-iteration TDM wait and barrier over
-# more tokens. T=16/C=1 is the largest tile that fits the 64KB LDS budget
-# while keeping the warp count a power of two.
+# reduce needs T*C*256/16 lanes, which is why the quantized path runs a narrower
+# block than the bf16 one.
+#
+# C=1 is what matters; T only sets the tile height. Now that the reduce
+# double-buffers its input tile, the iteration count barely registers -- T=32
+# measures the same 89us as T=16 at 16k tokens/rank despite halving the trip
+# count. C, on the other hand, decides the LDS read pattern: C=4 makes a wave
+# straddle two chunks and costs 24us (T=4/C=4 measures 113us at the same T*C, so
+# the same LDS footprint and lane count).
 _COMBINE_TOKENS_PER_BLOCK = 16
 _COMBINE_CHUNKS_PER_ITER = 1
 
@@ -203,7 +206,7 @@ class MegaMoEStage2Config:
     @property
     def combine_wire_nbytes(self) -> int:
         if self.combine_quant_fp8:
-            # Per chunk: 256B fp8 payload + 8B e8m0 scale + 8B alignment pad.
+            # Per chunk: 256B fp8 payload + 8B e8m0 scale, padded to a cache line.
             return (self.hidden_dim // _COMBINE_CHUNK_ELEMS) * _COMBINE_CHUNK_BYTES
         return self.hidden_dim * 2
 

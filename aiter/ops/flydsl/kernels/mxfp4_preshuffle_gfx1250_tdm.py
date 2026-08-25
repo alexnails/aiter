@@ -45,12 +45,18 @@ TDM_DESCRIPTOR_VERSION = 1
 # MXFP8 combine wire format (``ep_quant_fp8``). The hidden dim is cut into fixed
 # 256-element chunks; each chunk carries its own 8 e8m0 scale bytes right after
 # its payload, so payload and scale are one contiguous interval that a single
-# TDM descriptor moves together. The 8-byte tail pads the chunk to 272 so every
-# chunk (and every scale run) stays 16-byte aligned on both the write and the
-# read side; 256 is fixed rather than tied to tile_n so the wire format does not
-# drift with the GEMM tuning table.
+# TDM descriptor moves together. 256 is fixed rather than tied to tile_n so the
+# wire format does not drift with the GEMM tuning table.
+#
+# The chunk pads to 384 rather than to the 272 that 16-byte alignment alone would
+# need. 384 is a multiple of 128, so every chunk -- and every TDM row on both the
+# scatter and the combine side -- starts on a cache line; at 272 each row started
+# mid-line, and the resulting over-fetch cost this epilogue 123us/layer at 16k
+# tokens/rank even though it moved 41% fewer bytes. 384 is also an *odd* multiple
+# of 128, so the LDS staging rows rotate across banks instead of all landing on
+# bank 0: 512 is equally line-aligned but measured 58us/layer worse than 384.
 EP_CHUNK_ELEMS = 256
-EP_CHUNK_BYTES = 272
+EP_CHUNK_BYTES = 384
 # GEMM2 has no activation, so one acc holds 8 f32 -> 2 wn subtiles per lane give
 # 16 values, and the two kgrp halves merge into the full 32-element MX block.
 WN_PER_MX_BLOCK_EP = 2

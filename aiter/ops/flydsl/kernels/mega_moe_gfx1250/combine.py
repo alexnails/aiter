@@ -53,11 +53,12 @@ from .config import (
 
 # MXFP8 combine wire format, mirrored from the gemm2 scatter epilogue: the
 # hidden dim is cut into 256-element chunks, each carrying its own 8 e8m0 scale
-# bytes immediately after its payload (plus 8 bytes of padding to keep every
-# chunk 16-byte aligned). Payload and scale being one interval is what lets a
-# single TDM descriptor bring both in together.
+# bytes immediately after its payload, then padded to a cache line. Payload and
+# scale being one interval is what lets a single TDM descriptor bring both in
+# together. See EP_CHUNK_BYTES in mxfp4_preshuffle_gfx1250_tdm.py for why the pad
+# goes to 384; keep the two in sync.
 CHUNK_ELEMS = 256
-CHUNK_BYTES = 272
+CHUNK_BYTES = 384
 # Bytes each lane dequantizes per round; 16 fp8 sit inside one 32-element MX
 # block, so a round needs exactly one scale byte.
 LANE_BYTES = 16
@@ -212,9 +213,19 @@ def _make_combine_fused_reduce_mxfp8(
             f"must be a multiple of the block's lane count ({lanes})"
         )
     ROUNDS = SLOTS // lanes
-    LDS_BYTES = IN_ROWS * IN_ROW_BYTES + T_TOK * OUT_ROW_BYTES
-    if LDS_BYTES > 64 * 1024:
-        raise ValueError(f"combine LDS tile is {LDS_BYTES} bytes, over the 64KB budget")
+    # Two input tiles so iteration i+1's TDM load is in flight across iteration
+    # i's dequantize. One output tile is enough: the wait that frees it also
+    # retires the previous store, which by then has had a full round to land.
+    IN_BUFS = 2
+    IN_TILE_BYTES = IN_ROWS * IN_ROW_BYTES
+    OUT_TILE_BYTES = T_TOK * OUT_ROW_BYTES
+    LDS_BYTES = IN_BUFS * IN_TILE_BYTES + OUT_TILE_BYTES
+    # gfx1250 gives a workgroup 320KB of LDS; the reduce runs 512 blocks on 256
+    # CUs, so staying under half of that keeps the 2-blocks-per-CU occupancy.
+    if LDS_BYTES > 160 * 1024:
+        raise ValueError(
+            f"combine LDS tile is {LDS_BYTES} bytes, over the 160KB budget"
+        )
 
     slot_stride = slot_stride_nbytes
     iters_per_tok = n_chunks // C_CHK
@@ -254,13 +265,18 @@ def _make_combine_fused_reduce_mxfp8(
         lds_load_b128, lds_store_b128 = make_lds_copy_ops(128)
 
         smem = fx.SharedAllocator(static=False)
-        in_ptr = smem.allocate(IN_ROWS * IN_ROW_BYTES)._ptr
-        out_ptr = smem.allocate(T_TOK * OUT_ROW_BYTES)._ptr
+        in_base = smem.allocate(IN_BUFS * IN_TILE_BYTES)._ptr
+        out_ptr = smem.allocate(OUT_TILE_BYTES)._ptr
 
         def ptr_to_idx(p):
             return fx.index_cast(T.index, fx.ptrtoint(p))
 
-        in_idx = ptr_to_idx(in_ptr)
+        def in_buf_ptr(s):
+            """Input tile ``s``. Plain pointer math, so ``s`` may be a runtime
+            value -- that is what lets the work loop stay a single unrolled-by-one
+            trip instead of being peeled to make the buffer index a constant."""
+            return in_base + s * IN_TILE_BYTES
+
         out_idx = ptr_to_idx(out_ptr)
 
         p8_shared = fx.PointerType.get(
@@ -292,11 +308,13 @@ def _make_combine_fused_reduce_mxfp8(
         def lds_view(ptr, shape, stride):
             return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
 
-        lds_in = lds_view(
-            fx.recast_iter(p8_shared, in_ptr),
-            (IN_ROWS, IN_ROW_BYTES),
-            (IN_ROW_BYTES, 1),
-        )
+        def lds_in_view(s):
+            return lds_view(
+                fx.recast_iter(p8_shared, in_buf_ptr(s)),
+                (IN_ROWS, IN_ROW_BYTES),
+                (IN_ROW_BYTES, 1),
+            )
+
         lds_out = lds_view(
             fx.recast_iter(p16_shared, out_ptr),
             (T_TOK, OUT_ROW_ELEMS),
@@ -326,13 +344,24 @@ def _make_combine_fused_reduce_mxfp8(
             safe_tok + arith.constant(T_TOK - 1)
         ) // arith.constant(T_TOK)
         total_work = n_groups * arith.constant(iters_per_tok)
-        for work in range(bid, total_work, block_num):
+        last_work = total_work - arith.constant(1)
+
+        def tile_origin(work):
             grp = work // arith.constant(iters_per_tok)
             it = work % arith.constant(iters_per_tok)
-            tok0 = grp * arith.constant(T_TOK)
-            q0 = it * arith.constant(C_CHK)
+            return grp * arith.constant(T_TOK), it * arith.constant(C_CHK)
 
-            # -- global -> LDS: T*topk slot rows, payload and scale together --
+        def issue_load(work, buf, live):
+            """-- global -> LDS: T*topk slot rows, payload and scale together --
+
+            ``live`` false means this is the prefetch of a work item that does not
+            exist, on a block's last trip. The copy is still issued -- every
+            iteration must contribute the same amount to tensorcnt for the wait
+            below to be a constant -- but shrunk to a single row so it costs
+            nothing. Its index is pinned in range too, so the address is valid.
+            """
+            work = arith.select(work > last_work, last_work, work)
+            tok0, q0 = tile_origin(work)
             # Clamped to the tile height: the descriptor packs the bound into a
             # narrow field, and (tokens-tok0)*topk overflows it at 16k tokens
             # (98304). Only IN_ROWS rows are ever fetched, so any larger bound
@@ -343,6 +372,7 @@ def _make_combine_fused_reduce_mxfp8(
                 arith.constant(IN_ROWS),
                 _rows_left,
             )
+            row_oob = arith.select(live, row_oob, arith.constant(1))
             g_off = fx.Int64(tok0) * fx.Int64(topk * slot_stride) + fx.Int64(
                 q0
             ) * fx.Int64(CHUNK_BYTES)
@@ -355,11 +385,11 @@ def _make_combine_fused_reduce_mxfp8(
                 strides=[slot_stride, None],
                 num_warps=warp_num_per_block,
             )
-            fx.copy(atom_in, gt_in, lds_in)
-            tdm_ops.tensor_wait(0)
-            workgroup_barrier()
+            fx.copy(atom_in, gt_in, lds_in_view(buf))
 
-            # -- dequantize and sum the topk slots out of LDS --
+        def reduce_tile(buf):
+            """-- dequantize and sum the topk slots out of LDS --"""
+            in_idx = ptr_to_idx(in_buf_ptr(buf))
             for r in range_constexpr(ROUNDS):
                 t_off = lane_tok[r] * arith.constant(topk * IN_ROW_BYTES)
                 base_in = (
@@ -400,9 +430,10 @@ def _make_combine_fused_reduce_mxfp8(
                         out_b + arith.constant(j * 16),
                         accs[j].to(fx.BFloat16).bitcast(fx.Int32).ir_value(),
                     )
-            workgroup_barrier()
 
-            # -- LDS -> global: T bf16 token rows, padding rows clamped away --
+        def store_tile(work):
+            """-- LDS -> global: T bf16 token rows, padding rows clamped away --"""
+            tok0, q0 = tile_origin(work)
             out_off = fx.Int64(tok0) * fx.Int64(hidden_dim) + fx.Int64(
                 q0
             ) * fx.Int64(CHUNK_ELEMS)
@@ -424,9 +455,26 @@ def _make_combine_fused_reduce_mxfp8(
                 num_warps=warp_num_per_block,
             )
             fx.copy(atom_out, lds_out, gt_out)
-            tdm_ops.tensor_wait(0)
-            # Next iteration's TDM load overwrites lds_in; the barrier above
-            # already retired every lane's reads of it.
+
+        # Prime buffer 0. bid < block_num, so work // block_num is the trip count
+        # and its parity picks the buffer -- trip 0 reads what this load writes.
+        issue_load(bid, arith.constant(0), bid <= last_work)
+        for work in range(bid, total_work, block_num):
+            buf = (work // arith.constant(block_num)) % arith.constant(2)
+            nxt = work + arith.constant(block_num)
+            # Prefetch the tile this block wants next before touching the one it
+            # already has, so the load overlaps the dequantize below.
+            issue_load(nxt, arith.constant(1) - buf, nxt <= last_work)
+            # Exactly one TDM may still be in flight: the prefetch just issued.
+            # In issue order everything older has retired -- this tile's own load
+            # (so its buffer is readable) and the previous trip's store (so
+            # lds_out is free to overwrite).
+            tdm_ops.tensor_wait(1)
+            workgroup_barrier()
+            reduce_tile(buf)
+            workgroup_barrier()
+            store_tile(work)
+        tdm_ops.tensor_wait(0)
 
     @flyc.jit
     def run(
