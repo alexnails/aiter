@@ -377,7 +377,8 @@ def _calc_diff(x, y):
 
 
 # Accuracy budget, measured on gfx1250 (2 ranks, 1024 tok/rank, 7168x3072, E=384,
-# topk=6, --combine fused -- the worst of the quant x combine scenarios).
+# topk=6, --combine fused --combine_quant mxfp8 -- the worst of the six
+# quant x combine scenarios).
 #
 # _calc_diff is ||x-y||^2 / (||x||^2 + ||y||^2), a SQUARED error, and the per-layer
 # errors accumulate as a random walk: r ~ sqrt(L) makes r^2 ~ L, so the metric grows
