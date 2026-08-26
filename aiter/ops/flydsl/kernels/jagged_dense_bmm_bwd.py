@@ -33,7 +33,9 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr.vector import full
+from flydsl.expr.typing import T, full
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 # Forward tile/shape constants + the runtime-bounded buffer helper, shared so
 # forward and backward stay in lockstep. Imported dual-path so this module works
@@ -48,6 +50,8 @@ BLOCK_K = _fwd.BLOCK_K
 BLOCK_M = _fwd.BLOCK_M
 BLOCK_N = _fwd.BLOCK_N
 STAGES_A = _fwd.STAGES_A
+THREADS = _fwd.THREADS
+C_FRAG_LEN = BLOCK_M * BLOCK_N // THREADS
 make_bounded_buffer_tensor = _fwd.make_bounded_buffer_tensor
 
 # --- D-INDEPENDENT constants (module-level; the kernels snapshot these as fixed
@@ -210,15 +214,15 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
             block_m_idx = group_mn * fx.Int32(COARSEN_M) + fx.Int32(m_sub)
 
             # Device group resolution; scalarize to keep group-derived values uniform.
-            seq_rsrc = fx.buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
-            seq_start = fx.buffer_ops.buffer_load(
-                seq_rsrc, fx.Int32(off_b), vec_width=1, dtype=fx.T.i32()
+            seq_rsrc = buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
+            seq_start = buffer_ops.buffer_load(
+                seq_rsrc, fx.Int32(off_b), vec_width=1, dtype=T.i32
             )
-            seq_end = fx.buffer_ops.buffer_load(
-                seq_rsrc, fx.Int32(off_b) + fx.Int32(1), vec_width=1, dtype=fx.T.i32()
+            seq_end = buffer_ops.buffer_load(
+                seq_rsrc, fx.Int32(off_b) + fx.Int32(1), vec_width=1, dtype=T.i32
             )
-            seq_start = fx.rocdl.readfirstlane(fx.T.i32(), seq_start)
-            seq_end = fx.rocdl.readfirstlane(fx.T.i32(), seq_end)
+            seq_start = fx.rocdl.readfirstlane(T.i32, seq_start)
+            seq_end = fx.rocdl.readfirstlane(T.i32, seq_end)
             M_b = seq_end - seq_start
             start_m = block_m_idx * fx.Int32(BLOCK_M)
 
@@ -414,9 +418,7 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
                 thr_gC = thr_copy_r2g_C.partition_S(gC)
 
                 mma_frag_C_bf16.store(
-                    fx.arith.trunc_f(
-                        fx.T.VectorType.get([64], fx.T.bf16()), mma_frag_C.load()
-                    )
+                    fx.arith.trunc_f(T.vec(C_FRAG_LEN, T.bf16), mma_frag_C.load())
                 )
                 fx.copy(
                     fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16),
@@ -531,15 +533,13 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
         k_off = (pid_kn // fx.Int32(NN_TILES)) * fx.Int32(DDENSE_BK)
         n_off = (pid_kn % fx.Int32(NN_TILES)) * fx.Int32(DDENSE_BN)
 
-        seq_rsrc = fx.buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
-        seq_start = fx.buffer_ops.buffer_load(
-            seq_rsrc, off_b, vec_width=1, dtype=fx.T.i32()
+        seq_rsrc = buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
+        seq_start = buffer_ops.buffer_load(seq_rsrc, off_b, vec_width=1, dtype=T.i32)
+        seq_end = buffer_ops.buffer_load(
+            seq_rsrc, off_b + fx.Int32(1), vec_width=1, dtype=T.i32
         )
-        seq_end = fx.buffer_ops.buffer_load(
-            seq_rsrc, off_b + fx.Int32(1), vec_width=1, dtype=fx.T.i32()
-        )
-        seq_start = fx.rocdl.readfirstlane(fx.T.i32(), seq_start)
-        seq_end = fx.rocdl.readfirstlane(fx.T.i32(), seq_end)
+        seq_start = fx.rocdl.readfirstlane(T.i32, seq_start)
+        seq_end = fx.rocdl.readfirstlane(T.i32, seq_end)
         M_b = seq_end - seq_start
 
         # Group-rebased buffers bounded to M_b rows: any local row >= M_b zero-fills
@@ -548,13 +548,13 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
         # reaches ~L ≈ 7.86M rows, so seq_start*K*2 ≈ 4 GB overflows int32 (silently
         # wrapping the descriptor base). num_records_bytes stays in-range (per-group,
         # M_b ≤ Mi) so an int32 product is fine there.
-        j_rsrc = fx.buffer_ops.create_buffer_resource(
+        j_rsrc = buffer_ops.create_buffer_resource(
             JAGGED,
             max_size=False,
             num_records_bytes=fx.Int64(fx.Int32(M_b) * fx.Int32(K) * fx.Int32(2)),
             base_byte_offset=fx.Int64(seq_start) * fx.Int64(K * 2),
         )
-        d_rsrc = fx.buffer_ops.create_buffer_resource(
+        d_rsrc = buffer_ops.create_buffer_resource(
             DOUT,
             max_size=False,
             num_records_bytes=fx.Int64(fx.Int32(M_b) * fx.Int32(N) * fx.Int32(2)),
@@ -635,9 +635,7 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
                 joff = (mt * fx.Int32(DDENSE_BM) + m_local) * fx.Int32(K) + (
                     k_off + k_local
                 )
-                jval = fx.buffer_ops.buffer_load(
-                    j_rsrc, joff, vec_width=1, dtype=fx.T.bf16()
-                )
+                jval = buffer_ops.buffer_load(j_rsrc, joff, vec_width=1, dtype=T.bf16)
                 fx.memref_store(jval, sJ, (k_local, m_local))
             tile_sum = fx.Float32(0.0)
             for i in fx.range_constexpr(_D_LDS_LOADS):
@@ -647,9 +645,7 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
                 doff = (mt * fx.Int32(DDENSE_BM) + m_local) * fx.Int32(N) + (
                     n_off + n_local
                 )
-                dval = fx.buffer_ops.buffer_load(
-                    d_rsrc, doff, vec_width=1, dtype=fx.T.bf16()
-                )
+                dval = buffer_ops.buffer_load(d_rsrc, doff, vec_width=1, dtype=T.bf16)
                 fx.memref_store(dval, sD, (n_local, m_local))
                 # Tail rows (m >= M_b) zero-fill via the bounded descriptor, so they add 0.
                 tile_sum = tile_sum + fx.Float32(dval)
@@ -694,9 +690,7 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
             mma_frag_C_retile = thr_copy_r2g_C.retile(mma_frag_C_bf16)
             thr_gPart = thr_copy_r2g_C.partition_S(gPart)
             mma_frag_C_bf16.store(
-                fx.arith.trunc_f(
-                    fx.T.VectorType.get([64], fx.T.bf16()), mma_frag_C.load()
-                )
+                fx.arith.trunc_f(T.vec(C_FRAG_LEN, T.bf16), mma_frag_C.load())
             )
             fx.copy(
                 fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16),
