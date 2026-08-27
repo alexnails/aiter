@@ -104,89 +104,102 @@ def _emit_local(config: Config, route, partial, shared, worker):
     with ir.InsertionPoint(work.body):
         token = arith.index_cast(T.i32, work.induction_variable)
         tid = fx.Int32(gpu.thread_idx.x)
-        column = tid * fx.Int32(8)
-        active = scf.IfOp(arith.cmpi(CmpIPredicate.ult, column, fx.Int32(window)))
-        with ir.InsertionPoint(active.then_block):
-            route_row_bytes = window + window // 8
-            route_row = buffer_ops.create_buffer_resource_from_addr(
-                fx.Int64(ptrtoint(route))
-                + fx.Int64(token) * fx.Int64(TOPK * route_row_bytes),
-                num_records_bytes=TOPK * route_row_bytes,
+        columns_per_pass = BLOCK * 8
+        column_passes = (window + columns_per_pass - 1) // columns_per_pass
+        for column_pass in range_constexpr(column_passes):
+            column = tid * fx.Int32(8) + fx.Int32(
+                column_pass * columns_per_pass
             )
-            acc = fx.Vector.filled(8, 0.0, fx.Float32)
-            for slot in range_constexpr(TOPK):
-                words = load_fp8_words(
-                    route_row,
-                    fx.Int32(slot * (route_row_bytes // 4))
-                    + column // fx.Int32(4),
-                    word_count=2,
-                    load_width=2,
-                    cache_modifier=2,
+            active = scf.IfOp(
+                arith.cmpi(CmpIPredicate.ult, column, fx.Int32(window))
+            )
+            with ir.InsertionPoint(active.then_block):
+                route_row_bytes = window + window // 8
+                route_row = buffer_ops.create_buffer_resource_from_addr(
+                    fx.Int64(ptrtoint(route))
+                    + fx.Int64(token) * fx.Int64(TOPK * route_row_bytes),
+                    num_records_bytes=TOPK * route_row_bytes,
                 )
-                scale = load_e8m0_scale(
-                    route_row,
-                    fx.Int32(slot * route_row_bytes + window)
-                    + column // fx.Int32(8),
-                    2,
-                )
-                values = decode_scaled_fp8_f32(words, scale)
-                acc = acc + fx.Vector.from_elements(values, fx.Float32)
+                acc = fx.Vector.filled(8, 0.0, fx.Float32)
+                for slot in range_constexpr(TOPK):
+                    words = load_fp8_words(
+                        route_row,
+                        fx.Int32(slot * (route_row_bytes // 4))
+                        + column // fx.Int32(4),
+                        word_count=2,
+                        load_width=2,
+                        cache_modifier=2,
+                    )
+                    scale = load_e8m0_scale(
+                        route_row,
+                        fx.Int32(slot * route_row_bytes + window)
+                        + column // fx.Int32(8),
+                        2,
+                    )
+                    values = decode_scaled_fp8_f32(words, scale)
+                    acc = acc + fx.Vector.from_elements(values, fx.Float32)
 
-            shared_row = buffer_ops.create_buffer_resource_from_addr(
-                fx.Int64(ptrtoint(shared)) + fx.Int64(token) * fx.Int64(H * 2),
-                num_records_bytes=H * 2,
-            )
-            shared_values = fx.Vector(
-                buffer_ops.buffer_load(
-                    shared_row,
-                    column,
-                    vec_width=8,
-                    dtype=T.bf16,
-                    cache_modifier=2,
+                shared_row = buffer_ops.create_buffer_resource_from_addr(
+                    fx.Int64(ptrtoint(shared))
+                    + fx.Int64(token) * fx.Int64(H * 2),
+                    num_records_bytes=H * 2,
                 )
-            ).extf(T.vec(8, T.f32))
-            acc = acc + shared_values
+                shared_values = fx.Vector(
+                    buffer_ops.buffer_load(
+                        shared_row,
+                        column,
+                        vec_width=8,
+                        dtype=T.bf16,
+                        cache_modifier=2,
+                    )
+                ).extf(T.vec(8, T.f32))
+                acc = acc + shared_values
 
-            lane = tid & fx.Int32(63)
-            local_max = fx.Float32(1e-10).maximumf(
-                fmath.absf(acc).reduce(ReductionOp.MAX)
-            )
-            max_bits = local_max.bitcast(fx.Int32)
-            for xor_lane in (1, 2):
-                remote_bits = fx.rocdl.ds_bpermute(
-                    T.i32,
-                    (lane ^ fx.Int32(xor_lane)) * fx.Int32(4),
-                    max_bits,
-                )
-                local_max = local_max.maximumf(
-                    fx.Int32(remote_bits).bitcast(fx.Float32)
+                lane = tid & fx.Int32(63)
+                local_max = fx.Float32(1e-10).maximumf(
+                    fmath.absf(acc).reduce(ReductionOp.MAX)
                 )
                 max_bits = local_max.bitcast(fx.Int32)
-            e8m0, quant_scale = e8m0_scale(local_max)
-            packed = pack_fp8_words(acc, quant_scale, 2)
-            payload_row = buffer_ops.create_buffer_resource_from_addr(
-                fx.Int64(ptrtoint(partial)) + fx.Int64(token) * fx.Int64(window),
-                num_records_bytes=window,
-            )
-            store_fp8_words(payload_row, column, packed, 2)
-            scale_leader = scf.IfOp(
-                arith.cmpi(CmpIPredicate.eq, lane & fx.Int32(3), fx.Int32(0))
-            )
-            with ir.InsertionPoint(scale_leader.then_block):
-                scale_row = buffer_ops.create_buffer_resource_from_addr(
+                for xor_lane in (1, 2):
+                    remote_bits = fx.rocdl.ds_bpermute(
+                        T.i32,
+                        (lane ^ fx.Int32(xor_lane)) * fx.Int32(4),
+                        max_bits,
+                    )
+                    local_max = local_max.maximumf(
+                        fx.Int32(remote_bits).bitcast(fx.Float32)
+                    )
+                    max_bits = local_max.bitcast(fx.Int32)
+                e8m0, quant_scale = e8m0_scale(local_max)
+                packed = pack_fp8_words(acc, quant_scale, 2)
+                payload_row = buffer_ops.create_buffer_resource_from_addr(
                     fx.Int64(ptrtoint(partial))
-                    + fx.Int64(m * window)
-                    + fx.Int64(token) * fx.Int64(groups_per_row),
-                    num_records_bytes=groups_per_row,
+                    + fx.Int64(token) * fx.Int64(window),
+                    num_records_bytes=window,
                 )
-                buffer_ops.buffer_store(
-                    e8m0.to(fx.Int8),
-                    scale_row,
-                    column // fx.Int32(32),
-                    offset_is_bytes=True,
+                store_fp8_words(payload_row, column, packed, 2)
+                scale_leader = scf.IfOp(
+                    arith.cmpi(
+                        CmpIPredicate.eq,
+                        lane & fx.Int32(3),
+                        fx.Int32(0),
+                    )
                 )
+                with ir.InsertionPoint(scale_leader.then_block):
+                    scale_row = buffer_ops.create_buffer_resource_from_addr(
+                        fx.Int64(ptrtoint(partial))
+                        + fx.Int64(m * window)
+                        + fx.Int64(token) * fx.Int64(groups_per_row),
+                        num_records_bytes=groups_per_row,
+                    )
+                    buffer_ops.buffer_store(
+                        e8m0.to(fx.Int8),
+                        scale_row,
+                        column // fx.Int32(32),
+                        offset_is_bytes=True,
+                    )
+                    scf.YieldOp([])
                 scf.YieldOp([])
-            scf.YieldOp([])
         scf.YieldOp([])
 
 
