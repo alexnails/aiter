@@ -25,7 +25,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
 from flydsl.expr import arith, range_constexpr, tdm_ops
-from flydsl.expr.rocdl import cvt_scale_pk8_f32_fp8
+from flydsl.expr.rocdl import cvt_scale_pk8_f32_fp4, cvt_scale_pk8_f32_fp8
 from flydsl.expr.typing import Int32, Int64, T
 from flydsl.expr.typing import Vector as Vec
 
@@ -44,14 +44,17 @@ from .config import (
     _WAVE_SIZE as WAVE,
 )
 
-# MXFP8 combine wire format, mirrored from the gemm2 scatter epilogue: the
-# hidden dim is cut into 256-element chunks, each carrying its own 8 e8m0 scale
-# bytes immediately after its payload, then padded to a cache line. Payload and
-# scale being one interval is what lets a single TDM descriptor bring both in
-# together. See EP_CHUNK_BYTES in mxfp4_preshuffle_gfx1250_tdm.py for why the pad
-# goes to 384; keep the two in sync.
+# MX combine wire format, mirrored from the gemm2 scatter epilogue: a slot is a
+# payload plane of hidden fp8 (or half that many fp4) bytes followed by a scale
+# plane of hidden/32 e8m0 bytes. Interleaving them per chunk instead would need every chunk padded to a
+# cache line to keep payload and scale one interval, and that pad was a third of
+# the wire. See EP_SCALE_BLOCK in mxfp4_preshuffle_gfx1250_tdm.py; keep the two in
+# sync.
+#
+# CHUNK_ELEMS is this kernel's own tile unit -- the elements one lane-slot group
+# covers -- and no longer a structure the wire knows about.
 CHUNK_ELEMS = 256
-CHUNK_BYTES = 384
+SCALE_BLOCK = 32
 # Elements each lane reduces per round. On the MXFP8 wire 16 fp8 sit inside one
 # 32-element MX block, so a round needs exactly one scale byte.
 LANE_BYTES = 16
@@ -135,7 +138,7 @@ def _make_combine_fused_reduce(
     block_num,
     warp_num_per_block,
     slot_stride_nbytes,
-    quant=False,
+    quant_bits=0,
     tokens_per_block=2,
     chunks_per_iter=4,
 ):
@@ -155,11 +158,17 @@ def _make_combine_fused_reduce(
     peers. One TDM load therefore brings ``T*topk`` slot rows into LDS, and the
     summed bf16 result goes back out through a second TDM store.
 
-    ``quant`` picks the wire. MXFP8 rows carry payload and scale together
-    because the wire interleaves them per chunk; a lane's 16 fp8 sit inside a
-    single 32-element MX block, so it needs exactly one scale byte per expert.
-    A bf16 wire has no scale plane, so the row is just the hidden slice and the
+    ``quant_bits`` picks the wire. An MX slot is two planes, so a trip issues two
+    loads into two LDS regions; a lane's 16 elements sit inside a single
+    32-element MX block, so it needs exactly one scale byte per expert -- one
+    b128 of payload on the fp8 wire, one b64 on fp4. A bf16 wire has no scale
+    plane, so there is one load, the row is just the hidden slice, and the
     lane's 16 elements are two b128 loads instead of one plus a scale dword.
+
+    On an MX wire ``chunks_per_iter`` wants to cover as much of the hidden dim as
+    it can: the scale plane contributes only C*8 bytes to a row, and anything
+    under a cache line makes the second load fetch lines it mostly discards,
+    giving back what dropping the interleave pad won.
 
     Staging beats reading the slots straight to registers on both wires, which
     is why the bf16 path lives here too. It used to have its own kernel that had
@@ -183,11 +192,17 @@ def _make_combine_fused_reduce(
             f"chunks_per_iter={C_CHK} must divide hidden chunks ({n_chunks})"
         )
 
-    # Elements a lane owns per round, and the wire bytes those take up.
+    # Elements a lane owns per round, and the wire bytes those take up. The two
+    # planes stage as two LDS regions, all the payload rows and then all the
+    # scale rows, so each stays a plain strided 2D region one TDM can fill.
     ELEMS_PER_LANE = LANE_BYTES
-    IN_CHUNK_BYTES = CHUNK_BYTES if quant else CHUNK_ELEMS * 2
+    IN_CHUNK_BYTES = (
+        CHUNK_ELEMS * quant_bits // 8 if quant_bits else CHUNK_ELEMS * 2
+    )
     IN_ROWS = T_TOK * topk
-    IN_ROW_BYTES = C_CHK * IN_CHUNK_BYTES
+    P_ROW_BYTES = C_CHK * IN_CHUNK_BYTES
+    S_ROW_BYTES = C_CHK * (CHUNK_ELEMS // SCALE_BLOCK) if quant_bits else 0
+    IN_SCALE_OFF = IN_ROWS * P_ROW_BYTES
     OUT_ROW_ELEMS = C_CHK * CHUNK_ELEMS
     OUT_ROW_BYTES = OUT_ROW_ELEMS * 2
     # Lane slots per iteration; one slot is ELEMS_PER_LANE elements of one token.
@@ -212,7 +227,7 @@ def _make_combine_fused_reduce(
     # a deeper pipeline to hide.
     IN_BUFS = 2
     OUT_BUFS = 2
-    IN_TILE_BYTES = IN_ROWS * IN_ROW_BYTES
+    IN_TILE_BYTES = IN_ROWS * (P_ROW_BYTES + S_ROW_BYTES)
     OUT_TILE_BYTES = T_TOK * OUT_ROW_BYTES
     LDS_BYTES = IN_BUFS * IN_TILE_BYTES + OUT_BUFS * OUT_TILE_BYTES
     # gfx1250 gives a workgroup 320KB of LDS; the reduce runs 512 blocks on 256
@@ -224,9 +239,17 @@ def _make_combine_fused_reduce(
 
     slot_stride = slot_stride_nbytes
     iters_per_tok = n_chunks // C_CHK
+    # A trip issues one load per plane and then one store, so the wait that
+    # hands this trip its input tile must leave the prefetch's loads and the
+    # previous trip's store in flight.
+    WAIT_N = (2 if quant_bits else 1) + 1
 
-    def _dequant_pk8(lo_i32, hi_i32, e8m0_i32):
-        """Native gfx1250 ``v_cvt_scale_pk8_f32_fp8``: 8 fp8 e4m3 -> 8 f32.
+    def _dequant_pk8(packed, e8m0_i32):
+        """Native gfx1250 ``v_cvt_scale_pk8_f32_{fp8,fp4}``: 8 MX values -> 8 f32.
+
+        ``packed`` is the two dwords holding 8 fp8 e4m3 (the fp8 op takes a
+        vector operand), or the single dword holding 8 fp4 e2m1 (the fp4 op
+        takes a scalar one).
 
         The scale is applied here rather than by the instruction. Letting the HW
         fold in the e8m0 (passing it as the scale operand instead of 127) costs
@@ -234,16 +257,26 @@ def _make_combine_fused_reduce(
         MXFP8 wire format alone only accounts for 0.070 -- so the conversion is
         run unscaled and the exact power of two is multiplied in afterwards.
         """
-        src = Vec.from_elements([lo_i32, hi_i32], fx.Int32).ir_value()
-        unscaled = Vec(
-            cvt_scale_pk8_f32_fp8(
+        if quant_bits == 8:
+            unscaled = cvt_scale_pk8_f32_fp8(
                 T.vec(8, T.f32),
-                src,
+                Vec.from_elements(packed, fx.Int32).ir_value(),
                 arith.constant(127),  # e8m0 for 2^0
                 0,
             )
-        )
-        return unscaled * (e8m0_i32 << arith.constant(23)).bitcast(fx.Float32)
+        else:
+            # The fp4 form reads its e8m0 out of a packed scale word and lanes
+            # 16-31 take a different byte of it than lanes 0-15 do, so a bare
+            # 127 leaves the upper half of the wave with a zero byte -- 2^-127,
+            # which flushes every value it converts to +-0. All four bytes have
+            # to carry the 2^0. (The fp8 form above only ever reads byte 0.)
+            unscaled = cvt_scale_pk8_f32_fp4(
+                T.vec(8, T.f32),
+                packed.ir_value(),
+                arith.constant(0x7F7F7F7F),
+                0,
+            )
+        return Vec(unscaled) * (e8m0_i32 << arith.constant(23)).bitcast(fx.Float32)
 
     @flyc.kernel(known_block_size=[lanes, 1, 1])
     def ep_combine_fused(
@@ -258,6 +291,10 @@ def _make_combine_fused_reduce(
         # body where a Context is established.
         lds_load_b32, _ = make_lds_copy_ops(32)
         lds_load_b128, lds_store_b128 = make_lds_copy_ops(128)
+        # An fp4 lane's 16 elements pack into 8 bytes, half of a b128.
+        lds_load_payload = (
+            make_lds_copy_ops(64)[0] if quant_bits == 4 else lds_load_b128
+        )
 
         smem = fx.SharedAllocator(static=False)
         in_base = smem.allocate(IN_BUFS * IN_TILE_BYTES)._ptr
@@ -307,8 +344,15 @@ def _make_combine_fused_reduce(
         def lds_in_view(s):
             return lds_view(
                 fx.recast_iter(p8_shared, in_buf_ptr(s)),
-                (IN_ROWS, IN_ROW_BYTES),
-                (IN_ROW_BYTES, 1),
+                (IN_ROWS, P_ROW_BYTES),
+                (P_ROW_BYTES, 1),
+            )
+
+        def lds_scale_view(s):
+            return lds_view(
+                fx.recast_iter(p8_shared, in_buf_ptr(s) + IN_SCALE_OFF),
+                (IN_ROWS, S_ROW_BYTES),
+                (S_ROW_BYTES, 1),
             )
 
         def lds_out_view(s):
@@ -349,7 +393,7 @@ def _make_combine_fused_reduce(
             return grp * arith.constant(T_TOK), it * arith.constant(C_CHK)
 
         def issue_load(work, buf, live):
-            """-- global -> LDS: T*topk slot rows, payload and scale together --
+            """-- global -> LDS: T*topk slot rows, one copy per wire plane --
 
             ``live`` false means the work item does not exist -- the prefetch on
             a block's last trip, or the literal ``False`` used to pad the
@@ -357,6 +401,9 @@ def _make_combine_fused_reduce(
             contribute the same amount to tensorcnt for the wait below to be a
             constant, but it shrinks to a single row so it costs nothing. Its
             index is pinned in range too, so the address stays valid.
+
+            The prologue's pad is the exception: it is one copy whatever the
+            wire, which is what makes ``WAIT_N`` uniform from trip 0 on.
             """
             work = arith.select(work > last_work, last_work, work)
             tok0, q0 = tile_origin(work)
@@ -374,11 +421,10 @@ def _make_combine_fused_reduce(
                 row_oob = arith.constant(1)
             else:
                 row_oob = arith.select(live, row_oob, arith.constant(1))
-            g_off = fx.Int64(tok0) * fx.Int64(topk * slot_stride) + fx.Int64(
-                q0
-            ) * fx.Int64(IN_CHUNK_BYTES)
+            slot_off = fx.Int64(tok0) * fx.Int64(topk * slot_stride)
+            g_off = slot_off + fx.Int64(q0) * fx.Int64(IN_CHUNK_BYTES)
             gt_in = global_view(
-                inp_iter, g_off, (IN_ROWS, IN_ROW_BYTES), (slot_stride, 1)
+                inp_iter, g_off, (IN_ROWS, P_ROW_BYTES), (slot_stride, 1)
             )
             atom_in = fx.rocdl.make_tdm_atom(
                 gt_in,
@@ -387,42 +433,72 @@ def _make_combine_fused_reduce(
                 num_warps=warp_num_per_block,
             )
             fx.copy(atom_in, gt_in, lds_in_view(buf))
+            if quant_bits and live is not False:
+                # The scale plane starts one payload plane into the slot.
+                g_off_s = (
+                    slot_off
+                    + fx.Int64(hidden_dim * quant_bits // 8)
+                    + fx.Int64(q0) * fx.Int64(CHUNK_ELEMS // SCALE_BLOCK)
+                )
+                gt_sc = global_view(
+                    inp_iter, g_off_s, (IN_ROWS, S_ROW_BYTES), (slot_stride, 1)
+                )
+                atom_sc = fx.rocdl.make_tdm_atom(
+                    gt_sc,
+                    [row_oob, None],
+                    strides=[slot_stride, None],
+                    num_warps=warp_num_per_block,
+                )
+                fx.copy(atom_sc, gt_sc, lds_scale_view(buf))
 
         def reduce_tile(buf):
             """-- dequantize and sum the topk slots out of LDS --"""
             in_idx = ptr_to_idx(in_buf_ptr(buf))
             out_idx = ptr_to_idx(out_buf_ptr(buf))
             for r in range_constexpr(ROUNDS):
-                t_off = lane_tok[r] * arith.constant(topk * IN_ROW_BYTES)
+                t_off = lane_tok[r] * arith.constant(topk * P_ROW_BYTES)
                 chunk_off = t_off + lane_chunk[r] * arith.constant(IN_CHUNK_BYTES)
                 accs = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(2)]
 
-                if quant:
-                    base_in = chunk_off + lane_elem[r]
-                    # Scale byte index within the chunk's 8-byte scale run; read
-                    # as a dword and shifted out so the byte stays unsigned.
-                    sc_i = lane_elem[r] // arith.constant(32)
+                if quant_bits:
+                    base_in = chunk_off + (
+                        lane_elem[r]
+                        if quant_bits == 8
+                        else lane_elem[r] // arith.constant(2)
+                    )
+                    # The lane's MX block scale, over in the scale region; read
+                    # as a dword and shifted out so the byte stays unsigned. The
+                    # region base and both row terms are dword multiples, so
+                    # rounding the byte index down is all the alignment needed.
+                    sc_i = lane_elem[r] // arith.constant(SCALE_BLOCK)
                     sc_dw = (
-                        chunk_off
-                        + arith.constant(CHUNK_ELEMS)
+                        arith.constant(IN_SCALE_OFF)
+                        + lane_tok[r] * arith.constant(topk * S_ROW_BYTES)
+                        + lane_chunk[r] * arith.constant(CHUNK_ELEMS // SCALE_BLOCK)
                         + (sc_i // arith.constant(4)) * arith.constant(4)
                     )
                     sc_sh = (sc_i % arith.constant(4)) * arith.constant(8)
                     for k_slot in range_constexpr(topk):
-                        row_b = arith.constant(k_slot * IN_ROW_BYTES)
-                        payload = lds_load_b128(in_idx, base_in + row_b)
-                        dw = lds_load_b32(in_idx, sc_dw + row_b)[0]
+                        payload = lds_load_payload(
+                            in_idx, base_in + arith.constant(k_slot * P_ROW_BYTES)
+                        )
+                        dw = lds_load_b32(
+                            in_idx, sc_dw + arith.constant(k_slot * S_ROW_BYTES)
+                        )[0]
                         e8m0 = (dw >> sc_sh) & arith.constant(0xFF)
                         for j in range_constexpr(2):
                             accs[j] = accs[j] + _dequant_pk8(
-                                payload[j * 2], payload[j * 2 + 1], e8m0
+                                [payload[j * 2], payload[j * 2 + 1]]
+                                if quant_bits == 8
+                                else payload[j],
+                                e8m0,
                             )
                 else:
                     # No scale plane, so the lane's 16 elements are a plain
                     # 32-byte run: one b128 per accumulator.
                     base_in = chunk_off + lane_elem[r] * arith.constant(2)
                     for k_slot in range_constexpr(topk):
-                        row_b = arith.constant(k_slot * IN_ROW_BYTES)
+                        row_b = arith.constant(k_slot * P_ROW_BYTES)
                         for j in range_constexpr(2):
                             raw = lds_load_b128(
                                 in_idx, base_in + row_b + arith.constant(j * 16)
@@ -483,12 +559,12 @@ def _make_combine_fused_reduce(
             # Prefetch the tile this block wants next before touching the one it
             # already has, so the load overlaps the dequantize below.
             issue_load(nxt, arith.constant(1) - buf, nxt <= last_work)
-            # Two TDMs may still be in flight: the prefetch just issued and the
-            # previous trip's store. In issue order everything older has retired
-            # -- this tile's own load, so its input buffer is readable, and the
+            # Only the prefetch just issued and the previous trip's store may
+            # still be in flight. In issue order everything older has retired --
+            # this tile's own load, so its input buffer is readable, and the
             # store from two trips back, which is the one that owned the output
             # buffer about to be rewritten.
-            tdm_ops.tensor_wait(2)
+            tdm_ops.tensor_wait(WAIT_N)
             workgroup_barrier()
             reduce_tile(buf)
             workgroup_barrier()

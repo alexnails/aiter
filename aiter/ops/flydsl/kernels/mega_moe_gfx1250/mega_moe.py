@@ -25,24 +25,40 @@ _DISPATCH_BACKENDS = ("flydsl", "mori")
 _MAX_WORLD_SIZE = 72
 _MAX_EXPERTS_PER_RANK = 512
 
-_COMBINE_QUANT_MODES = ("none", "mxfp8")
-# MXFP8 combine wire chunk, kept in sync with the gemm2 scatter epilogue and
-# the combine reduce kernel.
+_COMBINE_QUANT_MODES = ("none", "mxfp8", "mxfp4")
+# MX combine wire, kept in sync with the gemm2 scatter epilogue and the combine
+# reduce kernel: a slot is a payload plane of hidden fp8 bytes -- or half that
+# many fp4 bytes -- followed by a scale plane of hidden/32 e8m0 bytes. 256 stays
+# the reduce's lane-tile unit but is no longer a wire structure.
 _COMBINE_CHUNK_ELEMS = 256
-_COMBINE_CHUNK_BYTES = 384
+_COMBINE_SCALE_BLOCK = 32
 # Lane tile for the TDM combine: T tokens x C chunks per block iteration. The
-# reduce needs T*C*256/16 lanes, which is why the quantized path runs a narrower
+# reduce needs T*C*256/16 lanes, which is why the quantized path runs a wider
 # block than the bf16 one.
 #
-# C=1 is what matters; T only sets the tile height. Now that the reduce
-# double-buffers both tiles, the iteration count barely registers -- T=32
-# measured the same 89us as T=16 at 16k tokens/rank despite halving the trip
-# count, and it no longer fits the LDS budget anyway (176KB with two tiles a
-# side). C, on the other hand, decides the LDS read pattern: C=4 makes a wave
-# straddle two chunks and costs 24us (T=4/C=4 measures 113us at the same T*C, so
-# the same LDS footprint and lane count).
+# On the bf16 wire C=1 is what matters and T only sets the tile height. Now that
+# the reduce double-buffers both tiles, the iteration count barely registers --
+# T=32 measured the same 89us as T=16 at 16k tokens/rank despite halving the
+# trip count, and it no longer fits the LDS budget anyway (176KB with two tiles
+# a side). C, on the other hand, decides the LDS read pattern.
 _COMBINE_TOKENS_PER_BLOCK = 16
 _COMBINE_CHUNKS_PER_ITER = 1
+# The MXFP8 wire flips that. Its scale plane puts only C*8 bytes in a TDM row,
+# so a small C makes that load pull a whole line per row for a handful of bytes,
+# handing back what splitting the planes won. C wants to be as large as two
+# constraints allow: it must divide the chunk count, and -- conservatively, as
+# how a TDM copy splits rows over its warps is not visible from here -- the
+# tile's T*topk rows should divide evenly by its T*C/4 warps, which reduces to C
+# dividing 4*topk. At topk=6 over 28 chunks that leaves C=4: a 32-byte scale
+# row, so the plane still costs a line per row, but a quarter as many rows. T
+# then takes the tile as high as the 160KB budget allows.
+#
+# C>1 was not available on the interleaved wire: chunks were padded to 384B
+# there, so a wave straddling two of them cost 24us (T=4/C=4 measured 113us
+# against T=16/C=1's 89 at the same LDS footprint and lane count). Splitting the
+# planes makes the payload region contiguous, which is what removes that.
+_COMBINE_QUANT_TOKENS_PER_BLOCK = 8
+_COMBINE_QUANT_CHUNKS_PER_ITER = 4
 
 # mori's C++ EpArgs offset stems -> this package's arena region names. All eight
 # are bound when a plan is built even though mori's dispatch dereferences only the
@@ -146,9 +162,9 @@ class MegaMoEStage2Config:
                 f"combine_quant must be one of {_COMBINE_QUANT_MODES}, "
                 f"got {self.combine_quant!r}"
             )
-        if self.combine_quant == "mxfp8" and self.hidden_dim % _COMBINE_CHUNK_ELEMS:
+        if self.combine_quant != "none" and self.hidden_dim % _COMBINE_CHUNK_ELEMS:
             raise ValueError(
-                f"combine_quant='mxfp8' requires hidden_dim % "
+                f"combine_quant={self.combine_quant!r} requires hidden_dim % "
                 f"{_COMBINE_CHUNK_ELEMS} == 0, got {self.hidden_dim}"
             )
         if self.dispatch_backend not in _DISPATCH_BACKENDS:
@@ -201,14 +217,18 @@ class MegaMoEStage2Config:
         return self.hidden_dim * 2
 
     @property
-    def combine_quant_fp8(self) -> bool:
-        return self.combine_quant == "mxfp8"
+    def combine_quant_bits(self) -> int:
+        """Payload width on the combine wire; 0 keeps it bf16."""
+        return {"none": 0, "mxfp8": 8, "mxfp4": 4}[self.combine_quant]
 
     @property
     def combine_wire_nbytes(self) -> int:
-        if self.combine_quant_fp8:
-            # Per chunk: 256B fp8 payload + 8B e8m0 scale, padded to a cache line.
-            return (self.hidden_dim // _COMBINE_CHUNK_ELEMS) * _COMBINE_CHUNK_BYTES
+        if self.combine_quant_bits:
+            # A payload plane of MX bytes, then its e8m0 scale plane.
+            return (
+                self.hidden_dim * self.combine_quant_bits // 8
+                + self.hidden_dim // _COMBINE_SCALE_BLOCK
+            )
         return self.hidden_dim * 2
 
     @property
@@ -594,12 +614,13 @@ class MegaMoEGfx1250:
         # Keep the cross-device barrier in its own 1-block kernel so the reduce
         # grid is unconstrained. Both wires stage through LDS, so the block is
         # sized to the lane tile (T*C*256/16 lanes).
-        _lanes = (
-            _COMBINE_TOKENS_PER_BLOCK
-            * _COMBINE_CHUNKS_PER_ITER
-            * _COMBINE_CHUNK_ELEMS
-            // 16
-        )
+        if config.combine_quant_bits:
+            _comb_toks = _COMBINE_QUANT_TOKENS_PER_BLOCK
+            _comb_chunks = _COMBINE_QUANT_CHUNKS_PER_ITER
+        else:
+            _comb_toks = _COMBINE_TOKENS_PER_BLOCK
+            _comb_chunks = _COMBINE_CHUNKS_PER_ITER
+        _lanes = _comb_toks * _comb_chunks * _COMBINE_CHUNK_ELEMS // 16
         combine_specs = [(512, _lanes // _WAVE_SIZE)]
         self._combine_specs = combine_specs
         self._combine_variants = {
@@ -609,9 +630,9 @@ class MegaMoEGfx1250:
                 block_num=spec[0],
                 warp_num_per_block=spec[1],
                 slot_stride_nbytes=config.combine_slot_stride_bytes,
-                quant=config.combine_quant_fp8,
-                tokens_per_block=_COMBINE_TOKENS_PER_BLOCK,
-                chunks_per_iter=_COMBINE_CHUNKS_PER_ITER,
+                quant_bits=config.combine_quant_bits,
+                tokens_per_block=_comb_toks,
+                chunks_per_iter=_comb_chunks,
             )
             for spec in combine_specs
         }
@@ -783,7 +804,7 @@ class MegaMoEGfx1250:
             max_tokens_per_rank=self._config.max_tokens_per_rank,
             world_size=self._config.world_size,
             source_token_map=routing.source_token_map,
-            combine_quant_fp8=self._config.combine_quant_fp8,
+            combine_quant_bits=self._config.combine_quant_bits,
         )
 
     def _combine(self, routing: Routing) -> torch.Tensor:

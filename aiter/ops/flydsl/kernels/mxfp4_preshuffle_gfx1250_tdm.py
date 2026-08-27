@@ -32,6 +32,7 @@ from .mega_moe_gfx1250.tdm_gather_shim import (
 from .quant_utils import (
     emit_amax_e8m0_native_scale,
     emit_cvt_scalef32_pk8_fp4_bf16,
+    emit_cvt_scalef32_pk8_fp4_f32,
     emit_cvt_scalef32_pk8_fp8_f32,
 )
 from .tensor_shim import (
@@ -42,21 +43,26 @@ from .tensor_shim import (
 
 TDM_DESCRIPTOR_VERSION = 1
 
-# MXFP8 combine wire format (``ep_quant_fp8``). The hidden dim is cut into fixed
-# 256-element chunks; each chunk carries its own 8 e8m0 scale bytes right after
-# its payload, so payload and scale are one contiguous interval that a single
-# TDM descriptor moves together. 256 is fixed rather than tied to tile_n so the
-# wire format does not drift with the GEMM tuning table.
+# MXFP8 combine wire format (``ep_quant_bits``): a slot holds two planes, N
+# payload bytes followed by N/32 e8m0 scale bytes. The block is 32 elements,
+# fixed rather than tied to tile_n so the wire does not drift with the GEMM
+# tuning table.
 #
-# The chunk pads to 384 rather than to the 272 that 16-byte alignment alone would
-# need. 384 is a multiple of 128, so every chunk -- and every TDM row on both the
-# scatter and the combine side -- starts on a cache line; at 272 each row started
-# mid-line, and the resulting over-fetch cost this epilogue 123us/layer at 16k
-# tokens/rank even though it moved 41% fewer bytes. 384 is also an *odd* multiple
-# of 128, so the LDS staging rows rotate across banks instead of all landing on
-# bank 0: 512 is equally line-aligned but measured 58us/layer worse than 384.
-EP_CHUNK_ELEMS = 256
-EP_CHUNK_BYTES = 384
+# The planes used to be interleaved per 256-element chunk, each chunk padded to
+# 384 bytes so payload and scale formed one cache-line-aligned interval that a
+# single TDM descriptor moved together. That pad was 33% of the wire. Splitting
+# the planes drops it and costs a second gather-store here plus a second TDM
+# load in the reduce.
+#
+# Only the reduce's read gets smaller. A tile contributes tile_n/32 scale bytes
+# per row, far under the 128-byte store granularity, so this side writes the
+# same number of lines either way: splitting a chunk's store into 256B+8B
+# rather than 256B+128B moved 82.6MB less and ran within noise (1089.1 vs
+# 1084.9us). Both plane bases stay line-aligned -- N is a multiple of 128 and
+# the slot stride is a power of two -- and that must not slip; an earlier
+# 272-byte chunk pitch started every row mid-line and cost 123us/layer at 16k
+# tokens/rank despite moving 41% fewer bytes.
+EP_SCALE_BLOCK = 32
 # GEMM2 has no activation, so one acc holds 8 f32 -> 2 wn subtiles per lane give
 # 16 values, and the two kgrp halves merge into the full 32-element MX block.
 WN_PER_MX_BLOCK_EP = 2
@@ -99,7 +105,7 @@ def launch_gemm_a8w4_tdm(
     ep_slot_stride_bytes: Constexpr[int] = 0,
     ep_destination_stride: Constexpr[int] = 0,
     ep_world_size: Constexpr[int] = 0,
-    ep_quant_fp8: Constexpr[int] = 0,
+    ep_quant_bits: Constexpr[int] = 0,
     arg_ep_row_map: fx.Tensor = None,
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
@@ -166,7 +172,7 @@ def launch_gemm_a8w4_tdm(
         ep_slot_stride_bytes,
         ep_destination_stride,
         ep_world_size,
-        ep_quant_fp8,
+        ep_quant_bits,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -174,22 +180,23 @@ def launch_gemm_a8w4_tdm(
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
         if stage1_quant_out:
             raise ValueError("enable_ep_scatter is incompatible with stage1_quant_out")
-    if ep_quant_fp8:
+    if ep_quant_bits not in (0, 8, 4):
+        raise ValueError(f"ep_quant_bits must be 0, 8 or 4, got {ep_quant_bits}")
+    if ep_quant_bits:
         if not enable_ep_scatter:
-            raise ValueError("ep_quant_fp8 requires enable_ep_scatter")
-        # A tile row must map to a contiguous run of whole wire chunks, else its
-        # payload and its scale bytes are not one interval and the single
-        # gather-store descriptor cannot express the transfer. The tuning table
-        # only emits tile_n2 in {256, 512}, but env overrides (*_N2) bypass it.
-        if tile_n % EP_CHUNK_ELEMS != 0:
-            raise ValueError(
-                f"ep_quant_fp8 requires tile_n % {EP_CHUNK_ELEMS} == 0, got {tile_n}"
-            )
+            raise ValueError("ep_quant_bits requires enable_ep_scatter")
+        # A tile row must hold whole scale blocks, else its slice of the scale
+        # plane is not a whole number of bytes. 128 rather than EP_SCALE_BLOCK so
+        # the tile's slice of each plane also starts on a cache line. The tuning
+        # table only emits tile_n2 in {256, 512}, but env overrides (*_N2) bypass
+        # it.
+        if tile_n % 256 != 0:
+            raise ValueError(f"ep_quant_bits requires tile_n % 256 == 0, got {tile_n}")
         # Each MX block is WN_PER_MX_BLOCK_EP wn-subtiles wide (2 kgrp halves
         # merged by the shuffle_xor(16) inside emit_amax_e8m0_native_scale).
         if (tile_n // n_warp // 16) % WN_PER_MX_BLOCK_EP != 0:
             raise ValueError(
-                "ep_quant_fp8 requires wmma_n_rep % "
+                "ep_quant_bits requires wmma_n_rep % "
                 f"{WN_PER_MX_BLOCK_EP} == 0, got {tile_n // n_warp // 16}"
             )
     warp_tile_m = tile_m // m_warp
@@ -234,17 +241,22 @@ def launch_gemm_a8w4_tdm(
     # not a multiple of 32B, the least padding the gather-store descriptor can
     # take while still spreading the b128 writes off one bank.
     # Ternaries, not if/else: @flyc.jit does not let branch-local names escape.
-    # Quantized rows are chunk-interleaved bytes, not bf16 elements.
-    C_ROW_BYTES = (
-        (tile_n // EP_CHUNK_ELEMS) * EP_CHUNK_BYTES if ep_quant_fp8 else tile_n * 2
-    )
-    _lds_row_bytes = ((C_ROW_BYTES + 15) // 16) * 16
-    _lds_row_bytes = _lds_row_bytes + (16 if _lds_row_bytes % 32 == 0 else 0)
+    # Quantized rows are payload bytes, not bf16 elements, and their scale plane
+    # is staged in a second region sitting right behind the payload one.
+    def _lds_pitch(nbytes):
+        p = ((nbytes + 15) // 16) * 16
+        return p + (16 if p % 32 == 0 else 0)
+
+    C_ROW_BYTES = tile_n * ep_quant_bits // 8 if ep_quant_bits else tile_n * 2
+    EP_SCALE_ROW_BYTES = tile_n // EP_SCALE_BLOCK
+    _lds_row_bytes = _lds_pitch(C_ROW_BYTES)
+    _lds_scale_row_bytes = _lds_pitch(EP_SCALE_ROW_BYTES) if ep_quant_bits else 0
+    _ep_scale_lds_off = tile_m * _lds_row_bytes
     c_lds_pad_elems = (_lds_row_bytes - C_ROW_BYTES) // 2 if enable_ep_scatter else 0
     store_pad = c_lds_pad_elems if enable_ep_scatter else 16
     C_STORE_B = (
-        ((tile_m * _lds_row_bytes + 127) // 128) * 128
-        if ep_quant_fp8
+        ((_ep_scale_lds_off + tile_m * _lds_scale_row_bytes + 127) // 128) * 128
+        if ep_quant_bits
         else ((tile_m * (tile_n + store_pad) * 2 + 127) // 128) * 128
     )
     ARENA_B = max(num_buffers * PITCH, C_STORE_B)
@@ -271,7 +283,7 @@ def launch_gemm_a8w4_tdm(
         f"_wpt{num_waves_per_tensor_tdm}" if num_waves_per_tensor_tdm != 2 else ""
     )
     _ep = "_epscatter" if enable_ep_scatter else ""
-    _epq = "_epq8" if ep_quant_fp8 else ""
+    _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -1285,8 +1297,8 @@ def launch_gemm_a8w4_tdm(
                         ].bitcast(fx.Float32)
                         for wm in range_constexpr(wmma_m_rep)
                     ]
-                if const_expr(ep_quant_fp8):
-                    # MXFP8 staging. The per-32 block amax is reduced across the
+                if const_expr(ep_quant_bits):
+                    # MX staging. The per-32 block amax is reduced across the
                     # kgrp lane pair by the shuffle_xor(16) inside
                     # emit_amax_e8m0_native_scale, so quantization has to happen
                     # HERE, in registers: once the values reach LDS they are
@@ -1294,6 +1306,11 @@ def launch_gemm_a8w4_tdm(
                     # lands in LDS is already wire bytes, so the TDM store below
                     # is a pure move.
                     _v2i32_ty = T.vec(2, T.i32)
+                    _mx_dt = (
+                        MxDtype.FP8_E4M3
+                        if ep_quant_bits == 8
+                        else MxDtype.FP4_E2M1
+                    )
                     _n_mx_blks = output_n_rep // WN_PER_MX_BLOCK_EP
                     _is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
                     _p8_scale = fx.PointerType.get(
@@ -1323,29 +1340,45 @@ def launch_gemm_a8w4_tdm(
                                 for i in range_constexpr(8):
                                     _vals.append(acc[i] * _wf)
                             _scale_f32, _e8m0 = emit_amax_e8m0_native_scale(
-                                _vals, wave_size=WAVE, dtype=MxDtype.FP8_E4M3
+                                _vals, wave_size=WAVE, dtype=_mx_dt
                             )
                             for sub_wn in range_constexpr(WN_PER_MX_BLOCK_EP):
                                 wn = mx_blk * WN_PER_MX_BLOCK_EP + sub_wn
                                 col_rel = wnb + wn * 16 + kgrp * 8
-                                _packed = emit_cvt_scalef32_pk8_fp8_f32(
-                                    Vec.from_elements(
-                                        _vals[sub_wn * 8 : sub_wn * 8 + 8],
-                                        fx.Float32,
-                                    ).ir_value(),
-                                    _scale_f32,
-                                    v2i32_ty=_v2i32_ty,
-                                    rocdl=rocdl,
-                                )
-                                # 8 fp8 bytes at the chunk-relative column; both
-                                # terms are multiples of 8 so this stays aligned.
-                                lds_store_b64(
-                                    stC_idx,
-                                    _row_byte
-                                    + (col_rel // EP_CHUNK_ELEMS) * EP_CHUNK_BYTES
-                                    + col_rel % EP_CHUNK_ELEMS,
-                                    _packed,
-                                )
+                                _src8 = Vec.from_elements(
+                                    _vals[sub_wn * 8 : sub_wn * 8 + 8],
+                                    fx.Float32,
+                                ).ir_value()
+                                # col_rel is a multiple of 8, so the byte column
+                                # lands 8-aligned on the fp8 wire and 4-aligned
+                                # on the fp4 one.
+                                if const_expr(ep_quant_bits == 8):
+                                    lds_store_b64(
+                                        stC_idx,
+                                        _row_byte + col_rel,
+                                        emit_cvt_scalef32_pk8_fp8_f32(
+                                            _src8,
+                                            _scale_f32,
+                                            v2i32_ty=_v2i32_ty,
+                                            rocdl=rocdl,
+                                        ),
+                                    )
+                                else:
+                                    lds_store_b32(
+                                        stC_idx,
+                                        _row_byte + col_rel // 2,
+                                        Vec.from_elements(
+                                            [
+                                                emit_cvt_scalef32_pk8_fp4_f32(
+                                                    _src8,
+                                                    _scale_f32,
+                                                    i32_ty=T.i32,
+                                                    rocdl=rocdl,
+                                                )
+                                            ],
+                                            fx.Int32,
+                                        ),
+                                    )
                             # Both kgrp lanes hold the same block scale; one stores.
                             _sc_col = wnb + mx_blk * WN_PER_MX_BLOCK_EP * 16
                             if _is_kgrp0:
@@ -1353,10 +1386,9 @@ def launch_gemm_a8w4_tdm(
                                     _e8m0,
                                     _scale_lds
                                     + (
-                                        _row_byte
-                                        + (_sc_col // EP_CHUNK_ELEMS) * EP_CHUNK_BYTES
-                                        + EP_CHUNK_ELEMS
-                                        + (_sc_col % EP_CHUNK_ELEMS) // 32
+                                        row_rel * _lds_scale_row_bytes
+                                        + _sc_col // EP_SCALE_BLOCK
+                                        + _ep_scale_lds_off
                                     ),
                                 )
                 else:
@@ -1436,12 +1468,13 @@ def launch_gemm_a8w4_tdm(
                 # pe*K + slot over the single base lsa_ptr(0, off). perRankSize is
                 # measured in-kernel from the lsa_ptr stride. Each wave issues the
                 # gather-stores for its row groups, 8 rows per instruction.
-                # Quantized rows are raw wire bytes (payload and its scales are
-                # one interval per chunk), so the descriptor addresses bytes and
-                # a single store still covers both.
-                elem_bytes = 1 if ep_quant_fp8 else 2
-                _row_elems = C_ROW_BYTES if ep_quant_fp8 else STORE_N
-                _lds_row_elems = _lds_row_bytes if ep_quant_fp8 else STORE_PITCH
+                # Quantized rows carry the payload plane; the scale plane is a
+                # second store into the same slots at a plane-base offset. The
+                # descriptor addresses the payload plane in bytes on both wires,
+                # so a 4-bit element just halves the row length.
+                elem_bytes = 1 if ep_quant_bits else 2
+                _row_elems = C_ROW_BYTES if ep_quant_bits else STORE_N
+                _lds_row_elems = _lds_row_bytes if ep_quant_bits else STORE_PITCH
                 _stride_elems = ep_slot_stride_bytes // elem_bytes
                 _GRP = 8
                 _ngrp = (tile_m + _GRP - 1) // _GRP
@@ -1453,7 +1486,7 @@ def launch_gemm_a8w4_tdm(
                 # slot<K); dropped/padding rows use this index so the HW drops them.
                 _oob = _K * fx.Int32(ep_world_size)
                 _comb_ptr_ty = fx.PointerType.get(
-                    T.i8 if ep_quant_fp8 else T.i16,
+                    T.i8 if ep_quant_bits else T.i16,
                     address_space=fx.AddressSpace.Global,
                     alignment=16,
                 )
@@ -1465,14 +1498,20 @@ def launch_gemm_a8w4_tdm(
                     _comb_iter, 0, (_oob, _row_elems), (_stride_elems, 1)
                 )
                 _lds_c = lds_view(
-                    fx.recast_iter(fx.Int8 if ep_quant_fp8 else oc, base_ptr),
+                    fx.recast_iter(fx.Int8 if ep_quant_bits else oc, base_ptr),
                     (tile_m, _lds_row_elems),
                     (_lds_row_elems, 1),
                 )
-                if const_expr(ep_quant_fp8):
-                    # blk_n is a multiple of tile_n, itself a multiple of the
-                    # chunk, so a tile always starts on a chunk boundary.
-                    _gboff = (blk_n // EP_CHUNK_ELEMS) * EP_CHUNK_BYTES
+                if const_expr(ep_quant_bits):
+                    # Byte column of this tile in the payload plane: one byte per
+                    # element on the fp8 wire, half that on fp4.
+                    _elem_div = 8 // ep_quant_bits
+                    _gboff = blk_n64 // _elem_div
+                    # The scale plane starts one payload plane (N*bits/8 bytes)
+                    # into the slot; blk_n is a multiple of tile_n, itself a
+                    # multiple of the scale block, so the tile's scale run starts
+                    # whole.
+                    _gboff_s = n64 // _elem_div + blk_n64 // EP_SCALE_BLOCK
                 else:
                     _gboff = blk_n * elem_bytes
                 for g in range_constexpr(_ngrp):
@@ -1510,6 +1549,24 @@ def launch_gemm_a8w4_tdm(
                             global_byte_offset=_gboff,
                         )
                         tensor_store_gather(desc)
+                        if const_expr(ep_quant_bits):
+                            # Same rows and slot stride as the payload store;
+                            # only the plane base and the row width differ.
+                            desc_s = make_tensor_gather_descriptor(
+                                _comb_view,
+                                _lds_c,
+                                row_indices,
+                                row_width=_lds_scale_row_bytes,
+                                tensor_dim0=EP_SCALE_ROW_BYTES,
+                                tensor_dim1=_oob.ir_value(),
+                                stride=_stride_elems,
+                                elem_bytes=1,
+                                index_size=32,
+                                lds_byte_offset=_ep_scale_lds_off
+                                + base_row * _lds_scale_row_bytes,
+                                global_byte_offset=_gboff_s,
+                            )
+                            tensor_store_gather(desc_s)
                 tdm_ops.tensor_wait(0)
             else:
                 if const_expr(stage1_act):
