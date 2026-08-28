@@ -53,7 +53,7 @@ except (ImportError, ModuleNotFoundError):  # pragma: no cover
 
 torch.set_default_device("cuda")
 
-SUPPORTED_GFX = ["gfx942"]
+SUPPORTED_GFX = ("gfx942", "gfx950")
 SEED = 1234
 _COS_THRESH = 0.999
 
@@ -481,17 +481,14 @@ def _summarize(name, rows):
 
 
 def _backend_ready() -> bool:
-    from aiter.ops.flydsl.utils import is_flydsl_available
-
-    try:
-        return torch.cuda.is_available() and is_flydsl_available()
-    except ImportError:
+    if not _HAS_FLYDSL or not torch.cuda.is_available():
         return False
+    return get_gfx() in SUPPORTED_GFX
 
 
 _requires_backend = pytest.mark.skipif(
     not _backend_ready(),
-    reason="jdbba backward requires a ROCm/CUDA GPU and an importable flydsl",
+    reason="jdbba backward requires flydsl on gfx942/gfx950",
 )
 
 
