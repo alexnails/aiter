@@ -59,10 +59,9 @@ except Exception:  # noqa: BLE001 # pragma: no cover
 # gfx1250 grouped mxfp4 kernel knobs, all overridable from the environment.
 # AITER_FORCE_A8W4 picks the ACTIVATION dtype of the grouped kernel: 0 -> fp4
 # (a4w4), 1 -> fp8 (a8w4). The weights are mxfp4 either way; -q only decides how
-# they are laid out, so a4w4 is the default here and `AITER_FORCE_A8W4=1
-# -q a8w4_mxfp4` gets the fp8-activation variant back.
+# they are laid out. This pins a8w4; main() then drives it from the quant key.
 os.environ.setdefault("ENABLE_CK", "0")
-os.environ.setdefault("AITER_FORCE_A8W4", "0")
+os.environ.setdefault("AITER_FORCE_A8W4", "1")
 os.environ.setdefault("AITER_USE_GROUPED_GEMM", "1")
 os.environ.setdefault("AITER_BF16_FP8_MOE_BOUND", "0")
 # Both EP paths go through mori's HIP/JIT dispatch: MORI_V2_KERNEL_BACKEND picks
@@ -350,21 +349,28 @@ def _rmsnorm(x, eps=1e-6):
     return n.to(x.dtype)
 
 
-def _mxfp8_wire_roundtrip(y, block=32):
-    """Per-32 MXFP8 (e8m0 scale + e4m3) round-trip on one expert's weighted
-    contribution, mirroring what the mxfp8 combine wire does on device: the
-    GEMM2 epilogue quantizes after applying the route weight, and the combine
-    kernel dequantizes before summing. Lets the reference isolate wire-format
-    loss from kernel bugs -- see --ref_combine_quant."""
+def _mx_wire_roundtrip(y, mode, block=32):
+    """Per-32 MX (e8m0 scale + narrow element) round-trip on one expert's
+    weighted contribution, mirroring what the mxfp8 / mxfp4 combine wire does on
+    device: the GEMM2 epilogue quantizes after applying the route weight, and
+    the combine kernel dequantizes before summing. Lets the reference isolate
+    wire-format loss from kernel bugs -- see --ref_combine_quant."""
     shp = y.shape
     v = y.reshape(-1, block).float()
     amax = v.abs().amax(dim=1, keepdim=True)
-    e8m0 = fp4_utils.f32_to_mx_e8m0_scale(
-        amax, dtype=fp4_utils.MxDtypeInt.FP8_E4M3
-    )
+    fp8 = mode == "mxfp8"
+    mx_dt = fp4_utils.MxDtypeInt.FP8_E4M3 if fp8 else fp4_utils.MxDtypeInt.FP4_E2M1
+    e8m0 = fp4_utils.f32_to_mx_e8m0_scale(amax, dtype=mx_dt)
     s = fp4_utils.e8m0_to_f32(e8m0).float()
-    q = (v / s).to(torch.float8_e4m3fn).float() * s
-    return q.reshape(shp).to(y.dtype)
+    n = v / s
+    if fp8:
+        q = n.to(torch.float8_e4m3fn).float()
+    else:
+        # e2m1 has no torch dtype, so the fp4 leg goes through the packed
+        # encode/decode pair, which rounds RNE and saturates at 6.0 like the
+        # device-side cvt_scalef32_pk8_fp4_f32.
+        q = fp4_utils.mxfp4_to_f32(fp4_utils.f32_to_mxfp4(n))
+    return (q * s).reshape(shp).to(y.dtype)
 
 
 def _calc_diff(x, y):
@@ -398,6 +404,12 @@ _ACC_TOL = {  # quant key -> (per-layer slope, saturation)
 }
 _ACC_TOL_FALLBACK = _ACC_TOL["a4w4_mxfp4"]  # unknown key: assume the fp4 budget
 _ACC_TOL_SAFETY = 1.5
+# The table was calibrated with the mxfp8 wire; --combine_quant mxfp4 is NOT
+# covered by it. e2m1 keeps ~3 effective bits, so the wire alone costs several
+# times what fp8 does and will overshoot these numbers -- worst on a8w4, whose
+# baseline is small enough that the wire dominates it. Run mxfp4 with a matching
+# --ref_combine_quant mxfp4 (same round-trip in the reference, so what is left
+# is kernel error) or pin an explicit --logits_tol.
 
 
 def default_logits_tol(quant_key, n_layers):
@@ -501,8 +513,8 @@ class RefModel:
             w = (wts * sel).sum(dim=1)
             w1d, w2d = self._expert(int(g))
             contrib = w[rows, None] * self._ffn(xn[rows], w1d, w2d)
-            if self.wire_quant == "mxfp8":
-                contrib = _mxfp8_wire_roundtrip(contrib)
+            if self.wire_quant != "none":
+                contrib = _mx_wire_roundtrip(contrib, self.wire_quant)
             out[rows] += contrib
         return out + self._shared(xn)
 
@@ -842,6 +854,8 @@ def main():
     dist_ctx = Dist()
     dev = torch.device("cuda", dist_ctx.local_rank)
     spec = resolve_spec(args.quant_type, args.dispatch_commu_dtype)
+    # -q owns the activation dtype, so it wins over the module-level default.
+    os.environ["AITER_FORCE_A8W4"] = "0" if args.quant_type == "a4w4_mxfp4" else "1"
 
     if spec["is_mxfp4"] and get_gfx() not in ("gfx950", "gfx1250"):
         if dist_ctx.rank == 0:
@@ -861,7 +875,7 @@ def main():
         print(
             f"[cfg] world={dist_ctx.world} layers={n_layers} tokens/rank={ct} hidden={hdim} "
             f"inter={idim} E={E} topk={topk} EPR={E // dist_ctx.world} quant={args.quant_type} "
-            f"combine={args.combine} "
+            f"combine={args.combine} force_a8w4={os.environ['AITER_FORCE_A8W4']} "
             f"gate={spec['gate_mode'].name} shared_E={args.shared_experts} gfx={get_gfx()}",
             flush=True,
         )
@@ -1056,18 +1070,19 @@ def _parse_args():
     p.add_argument(
         "--combine_quant",
         type=str,
-        choices=["none", "mxfp8"],
+        choices=["none", "mxfp8", "mxfp4"],
         default=os.environ.get("COMBINE_QUANT", "none"),
         help="combine wire dtype for the fused combine: none (bf16) | mxfp8 "
-        "(fp8 e4m3 payload + per-1x32 e8m0 scale). Falls back to $COMBINE_QUANT.",
+        "(fp8 e4m3 payload) | mxfp4 (fp4 e2m1 payload), both with a per-1x32 "
+        "e8m0 scale plane. Falls back to $COMBINE_QUANT.",
     )
     p.add_argument(
         "--ref_combine_quant",
         type=str,
-        choices=["none", "mxfp8"],
+        choices=["none", "mxfp8", "mxfp4"],
         default="none",
         help="apply the same combine wire quantization inside the fp32 reference. "
-        "Diagnostic only: with --combine_quant mxfp8 it separates wire-format "
+        "Diagnostic only: matching it to --combine_quant separates wire-format "
         "loss (expected) from kernel bugs (not expected).",
     )
     return p.parse_args()
