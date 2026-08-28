@@ -3435,6 +3435,9 @@ def compile_mixed_moe_gemm2_common(
             f"got {shared_expert_id=} and {experts=}"
         )
     del b_nt
+    compose_config = getattr(_compose_entry, "gemm2_config", None)
+    output_epilogue = getattr(compose_config, "output_epilogue", None)
+    b_cache_modifier = int(getattr(compose_config, "b_cache_modifier", 0))
     _sort_block_m = tile_m if sort_block_m <= 0 else sort_block_m
     if const_expr(_sort_block_m != tile_m and _sort_block_m % tile_m != 0):
         raise ValueError(
@@ -3566,7 +3569,8 @@ def compile_mixed_moe_gemm2_common(
     def scale_elem_type():
         return T.i32
 
-    total_threads = 256
+    total_threads = int(getattr(compose_config, "block_threads", 256))
+    num_waves = total_threads // 64
     bytes_x_per_tile = int(tile_m) * int(tile_k) * int(a_elem_bytes)
     if const_expr(bytes_x_per_tile % total_threads != 0):
         raise ValueError(
@@ -3599,7 +3603,8 @@ def compile_mixed_moe_gemm2_common(
     if const_expr(persistent):
         from aiter.jit.utils.chip_info import get_cu_num
 
-        cu_num = get_cu_num() * int(cu_num_mul)
+        cu_num = getattr(compose_config, "persistent_groups", None)
+        cu_num = cu_num or get_cu_num() * int(cu_num_mul)
     else:
         cu_num = 0
     sbm_tag = "" if _sort_block_m == tile_m else f"_sbm{_sort_block_m}"
@@ -3768,7 +3773,7 @@ def compile_mixed_moe_gemm2_common(
             by = by_outer
 
             k_blocks16 = arith.constant(eff_tile_k_bytes // 16, index=True)
-            layout_tx_wave_lane = fx.make_layout((4, 64), stride=(64, 1))
+            layout_tx_wave_lane = fx.make_layout((num_waves, 64), stride=(64, 1))
             layout_lane16 = fx.make_layout((4, 16), stride=(16, 1))
 
             base_ptr = allocator.get_base()
@@ -4185,12 +4190,11 @@ def compile_mixed_moe_gemm2_common(
 
                 col_offset_base = lane_div_16 * arith.constant(16, index=True)
 
-                num_waves = 4
                 body_n_per_wave = body_tile_n // num_waves
                 body_num_acc_n = body_n_per_wave // 16
                 c_n_per_wave = arith.constant(body_n_per_wave, index=True)
-                wave_mod_4 = _mod_pow2(wave_id, 4)
-                n_tile_base = wave_mod_4 * c_n_per_wave
+                wave_in_tile = _mod_pow2(wave_id, num_waves)
+                n_tile_base = wave_in_tile * c_n_per_wave
 
                 body_by_n = by * arith.constant(tile_n, index=True) + arith.constant(
                     body_n_offset, index=True
@@ -4257,6 +4261,7 @@ def compile_mixed_moe_gemm2_common(
                             vec_elems=vec_elems,
                             elem_bytes=b_elem_bytes,
                             offset_in_bytes=(b_elem_bytes == 1),
+                            cache_modifier=b_cache_modifier,
                         )
                         b_i64x2 = vector.bitcast(vec2_i64, b16)
                         return (
@@ -5231,6 +5236,10 @@ def compile_mixed_moe_gemm2_common(
                         row_byte_base = out_base_idx + t_idx * arith.constant(
                             model_dim * out_elem_bytes, index=True
                         )
+                    elif output_epilogue is not None:
+                        row_byte_base = out_base_idx + ts_idx * arith.constant(
+                            output_epilogue.row_bytes, index=True
+                        )
                     elif const_expr(need_fp8_out):
                         row_byte_base = out_base_idx + ts_idx * arith.constant(
                             out_row_bytes_const, index=True
@@ -5252,7 +5261,15 @@ def compile_mixed_moe_gemm2_common(
 
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
                     _fused, row_byte_base, row_byte_off_i32 = row_ctx
-                    if const_expr(need_fp8_out):
+                    if output_epilogue is not None:
+                        output_epilogue.store(
+                            row_ctx=row_ctx,
+                            col_g0=col_g0,
+                            frag=frag,
+                            e_vec=e_vec,
+                            idx_to_llvm_ptr=idx_to_llvm_ptr,
+                        )
+                    elif const_expr(need_fp8_out):
                         # frag is vector<e_vec x f32>; e_vec==8 == one opus
                         # 8-col MXFP8 group. Quantize to e4m3 + one e8m0 byte.
                         c0_i32_q = fx.Int32(0)
@@ -5373,7 +5390,13 @@ def compile_mixed_moe_gemm2_common(
                             alignment=e_vec * out_elem_bytes,
                         )
 
-                e_vec = 2 if accumulate else min(body_tile_n // 32, 8)
+                if output_epilogue is None:
+                    e_vec = 2 if accumulate else min(body_tile_n // 32, 8)
+                    cshuffle_nlane = 32
+                else:
+                    e_vec, cshuffle_nlane = output_epilogue.cshuffle_layout(
+                        body_tile_n
+                    )
                 rocdl.s_setprio(3)
                 c_shuffle_epilog(
                     arith=arith,
@@ -5384,6 +5407,8 @@ def compile_mixed_moe_gemm2_common(
                     tile_m=tile_m,
                     tile_n=body_tile_n,
                     e_vec=e_vec,
+                    cshuffle_nlane=cshuffle_nlane,
+                    block_size=total_threads,
                     m_repeat=m_repeat,
                     num_acc_n=body_num_acc_n,
                     tx=tx,
@@ -5430,6 +5455,8 @@ def compile_mixed_moe_gemm2_common(
                     emit_moe_gemm2_body()
                     scf.YieldOp([])
 
+                if compose_config is not None:
+                    compose_config.emit_final_sync(mi_p, c1_p, tiles_per_block)
                 gpu.barrier()
                 scf.YieldOp([cur_active])
             else:

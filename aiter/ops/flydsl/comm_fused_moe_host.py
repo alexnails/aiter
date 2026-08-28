@@ -2,7 +2,7 @@
 """Production host runtime for communication-fused FlyDSL MoE."""
 
 import csv
-from dataclasses import dataclass, fields
+from dataclasses import MISSING, dataclass, fields
 from functools import cache
 from pathlib import Path
 
@@ -14,6 +14,7 @@ from mori.cco import Communicator
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.comm_fused_moe import atomic_compressed
 from aiter.ops.flydsl.kernels.comm_fused_moe import full_width
+from aiter.ops.flydsl.kernels.comm_fused_moe import owner_reduce_megakernel
 from aiter.ops.flydsl.kernels.comm_fused_moe import persistent_window
 from aiter.ops.flydsl.kernels.comm_fused_moe import windowed
 from aiter.ops.flydsl.kernels.comm_fused_moe.sync import (
@@ -25,6 +26,7 @@ from aiter.ops.flydsl.moe_kernels import _run_compiled
 
 
 _CONFIG_PATH = Path(__file__).parents[2] / "configs" / "comm_fused_moe.csv"
+_PEER_VMM_ALLOCATION_ALIGNMENT = 2 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,12 +42,14 @@ class ShapeKey:
 PipelineConfig = (
     atomic_compressed.Config
     | full_width.Config
+    | owner_reduce_megakernel.OwnerMegaKernelConfig
     | windowed.Config
     | persistent_window.Config
 )
 _CONFIG_TYPES = {
     "atomic": atomic_compressed.Config,
     "full": full_width.Config,
+    "owner_mega": owner_reduce_megakernel.OwnerMegaKernelConfig,
     "window": windowed.Config,
     "persistent": persistent_window.Config,
 }
@@ -54,9 +58,24 @@ _RUNNER_CACHE = {}
 
 def _config(row) -> PipelineConfig:
     config_type = _CONFIG_TYPES[row["family"]]
-    return config_type(
-        **{field.name: int(row[field.name]) for field in fields(config_type)}
-    )
+    values = {}
+    for field in fields(config_type):
+        raw = row.get(field.name)
+        if raw in (None, ""):
+            if field.default is not MISSING:
+                values[field.name] = field.default
+                continue
+            if field.default_factory is not MISSING:
+                values[field.name] = field.default_factory()
+                continue
+            raise KeyError(field.name)
+        if field.type is str:
+            values[field.name] = raw
+        elif field.type is bool:
+            values[field.name] = bool(int(raw))
+        else:
+            values[field.name] = int(raw)
+    return config_type(**values)
 
 
 @cache
@@ -85,13 +104,35 @@ def winners_for(shape: ShapeKey) -> dict[int, PipelineConfig]:
 
 
 def _symmetric(device, shape) -> torch.Tensor:
-    return symm_mem.empty(shape, dtype=torch.uint8, device=device)
+    requested_bytes = 1
+    for extent in shape:
+        requested_bytes *= int(extent)
+    alignment = _PEER_VMM_ALLOCATION_ALIGNMENT
+    allocated_bytes = max(
+        alignment,
+        (requested_bytes + alignment - 1) // alignment * alignment,
+    )
+    return symm_mem.empty(
+        (allocated_bytes,), dtype=torch.uint8, device=device
+    )
 
 
-def _workspace(device, payload_bytes: int) -> torch.Tensor:
-    tensor = _symmetric(device, ((payload_bytes + 8 + 255) // 256 * 256,))
-    tensor[payload_bytes : payload_bytes + 8].zero_()
-    return tensor
+def _packed_symmetric(
+    device, sizes: tuple[int, ...]
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[int, ...]]:
+    """Carve aligned views from one peer-VMM allocation and CCO window."""
+    offsets = []
+    total_bytes = 0
+    for size in sizes:
+        total_bytes = (total_bytes + 255) // 256 * 256
+        offsets.append(total_bytes)
+        total_bytes += int(size)
+    workspace = _symmetric(device, (total_bytes,))
+    tensors = tuple(
+        workspace.narrow(0, offset, int(size))
+        for offset, size in zip(offsets, sizes)
+    )
+    return workspace, tensors, tuple(offsets)
 
 
 def _register(tp_group, rank: int, tp: int, tensors):
@@ -141,26 +182,29 @@ class _AtomicCompressedRunner:
         self.rank = int(tp_group.rank_in_group)
         self.device = torch.device(tp_group.device)
         self.partial_ready = config.m * (k.H + k.H // 32)
-        self.partial = _workspace(self.device, self.partial_ready)
         self.reduced_ready = config.shard_rows * k.H
-        self.reduced_payload = _workspace(self.device, self.reduced_ready)
-        self.reduced_scale = _symmetric(
-            self.device, (config.shard_rows, k.H // 32)
+        sizes = (
+            (self.partial_ready + 8 + 255) // 256 * 256,
+            (self.reduced_ready + 8 + 255) // 256 * 256,
+            config.shard_rows * (k.H // 32),
         )
+        self.workspace, tensors, offsets = _packed_symmetric(self.device, sizes)
+        self.partial, self.reduced_payload, self.reduced_scale = tensors
+        self.partial[self.partial_ready : self.partial_ready + 8].zero_()
+        self.reduced_payload[
+            self.reduced_ready : self.reduced_ready + 8
+        ].zero_()
         self.output = torch.empty(
             (config.m, k.H), dtype=torch.bfloat16, device=self.device
         )
-        self.comm, self.windows, bases = _register(
-            tp_group,
-            self.rank,
-            k.TP,
-            (self.partial, self.reduced_payload, self.reduced_scale),
+        self.comm, self.windows, (workspace_base,) = _register(
+            tp_group, self.rank, k.TP, (self.workspace,)
         )
         (
             self.partial_flat_base,
             self.reduced_payload_base,
             self.reduced_scale_base,
-        ) = bases
+        ) = tuple(workspace_base + offset for offset in offsets)
         shard_begin = self.rank * config.shard_rows
         self.reduced_shard = self.output[
             shard_begin : shard_begin + config.shard_rows
@@ -230,26 +274,29 @@ class _FullWidthRunner:
             device=self.device,
         )
         self.partial_ready = config.m * (k.H + k.H // 32)
-        self.partial = _workspace(self.device, self.partial_ready)
         self.reduced_ready = config.shard_rows * k.H
-        self.reduced_payload = _workspace(self.device, self.reduced_ready)
-        self.reduced_scale = _symmetric(
-            self.device, (config.shard_rows, k.H // 32)
+        sizes = (
+            (self.partial_ready + 8 + 255) // 256 * 256,
+            (self.reduced_ready + 8 + 255) // 256 * 256,
+            config.shard_rows * (k.H // 32),
         )
+        self.workspace, tensors, offsets = _packed_symmetric(self.device, sizes)
+        self.partial, self.reduced_payload, self.reduced_scale = tensors
+        self.partial[self.partial_ready : self.partial_ready + 8].zero_()
+        self.reduced_payload[
+            self.reduced_ready : self.reduced_ready + 8
+        ].zero_()
         self.output = torch.empty(
             (config.m, k.H), dtype=torch.bfloat16, device=self.device
         )
-        self.comm, self.windows, bases = _register(
-            tp_group,
-            self.rank,
-            k.TP,
-            (self.partial, self.reduced_payload, self.reduced_scale),
+        self.comm, self.windows, (workspace_base,) = _register(
+            tp_group, self.rank, k.TP, (self.workspace,)
         )
         (
             self.partial_flat_base,
             self.reduced_payload_base,
             self.reduced_scale_base,
-        ) = bases
+        ) = tuple(workspace_base + offset for offset in offsets)
         shard_begin = self.rank * config.shard_rows
         self.reduced_shard = self.output[
             shard_begin : shard_begin + config.shard_rows
@@ -311,6 +358,109 @@ class _FullWidthRunner:
         return self.output
 
 
+class _OwnerMegaKernelRunner:
+    """Single-launch route GEMM with per-N-tile owner consumers."""
+
+    def __init__(
+        self,
+        tp_group,
+        config: owner_reduce_megakernel.OwnerMegaKernelConfig,
+    ) -> None:
+        k = owner_reduce_megakernel
+        self.config = config
+        self.rank = int(tp_group.rank_in_group)
+        self.device = torch.device(tp_group.device)
+        self.workspace = _symmetric(self.device, (config.workspace_bytes,))
+        self.workspace.zero_()
+        self.output = self.workspace.narrow(
+            0, config.output_offset, config.payload_bytes
+        ).view(torch.bfloat16).view(config.m, k.H)
+        self.comm, self.windows, bases = _register(
+            tp_group,
+            self.rank,
+            k.TP,
+            (self.workspace,),
+        )
+        # All TP peers must finish registering the symmetric workspace before
+        # any rank can launch a kernel that dereferences a peer window.
+        tp_group.barrier()
+        self.shared_partial_window = None
+        self.shared_partial_ptr = None
+        self.shared_partial_flat_base = 0
+        (self.workspace_flat_base,) = bases
+        self.workspace.narrow(
+            0, config.flat_base_offset, 8
+        ).view(torch.int64).fill_(self.workspace_flat_base)
+
+    def prepare_shared_partial(
+        self, shared_partial: torch.Tensor
+    ) -> torch.Tensor:
+        """Stage a normal shared contribution in the registered output window."""
+
+        if not self.config.shared_bf16_partials:
+            return shared_partial
+        if self.config.collective != "rs_broadcast":
+            raise RuntimeError(
+                "workspace-backed shared BF16 partials require "
+                "collective='rs_broadcast'"
+            )
+        if shared_partial.data_ptr() != self.output.data_ptr():
+            self.output.copy_(shared_partial)
+        return self.output
+
+    def __call__(
+        self,
+        *,
+        stage2_args: tuple,
+        stage2_kwargs: dict,
+        shared_partial,
+        ordinary_stage2,
+    ):
+        del ordinary_stage2
+        k = owner_reduce_megakernel
+        stream = torch.cuda.current_stream(self.device)
+        if self.config.shared_bf16_partials:
+            shared_partial_ptr = shared_partial.data_ptr()
+            if shared_partial_ptr == self.output.data_ptr():
+                if self.shared_partial_ptr not in (None, shared_partial_ptr):
+                    raise RuntimeError(
+                        "owner megakernel shared_partial storage changed after "
+                        "symmetric registration"
+                    )
+                self.shared_partial_ptr = shared_partial_ptr
+                self.shared_partial_flat_base = (
+                    self.workspace_flat_base + self.config.output_offset
+                )
+            elif self.shared_partial_window is None:
+                self.shared_partial_window = self.comm.register_external_window(
+                    shared_partial_ptr,
+                    shared_partial.nbytes,
+                )
+                self.shared_partial_ptr = shared_partial_ptr
+                self.shared_partial_flat_base = (
+                    self.shared_partial_window.local_ptr
+                    - self.rank * FLAT_VA_RANK_STRIDE
+                )
+            elif shared_partial_ptr != self.shared_partial_ptr:
+                raise RuntimeError(
+                    "owner megakernel shared_partial storage changed after "
+                    "symmetric registration"
+                )
+        common = list(_stage2_args(stage2_args, stage2_kwargs, k, self.config))
+        _run_compiled(
+            k.compile_owner_megakernel(self.config, self.rank),
+            (
+                ptr_arg(self.workspace),
+                ptr_arg(shared_partial),
+                fx.Int64(self.shared_partial_flat_base),
+                *common[:8],
+                *common[9:],
+                stream,
+            ),
+        )
+        return self.output
+
+
 class _WindowedRunner:
     def __init__(self, tp_group, config: windowed.Config) -> None:
         k = windowed
@@ -326,26 +476,27 @@ class _WindowedRunner:
             for _ in range(k.SLOTS)
         )
         self.partial_ready = config.m * (config.window + config.window // 32)
-        self.partials = tuple(
-            _workspace(self.device, self.partial_ready) for _ in range(k.SLOTS)
-        )
         self.reduced_ready = config.shard_rows * config.window
-        self.reduced_payloads = tuple(
-            _workspace(self.device, self.reduced_ready) for _ in range(k.SLOTS)
+        sizes = (
+            ((self.partial_ready + 8 + 255) // 256 * 256,) * k.SLOTS
+            + ((self.reduced_ready + 8 + 255) // 256 * 256,) * k.SLOTS
+            + (config.shard_rows * (config.window // 32),) * k.SLOTS
         )
-        self.reduced_scales = tuple(
-            _symmetric(self.device, (config.shard_rows, config.window // 32))
-            for _ in range(k.SLOTS)
-        )
+        self.workspace, tensors, offsets = _packed_symmetric(self.device, sizes)
+        self.partials = tensors[: k.SLOTS]
+        self.reduced_payloads = tensors[k.SLOTS : 2 * k.SLOTS]
+        self.reduced_scales = tensors[2 * k.SLOTS :]
+        for partial in self.partials:
+            partial[self.partial_ready : self.partial_ready + 8].zero_()
+        for payload in self.reduced_payloads:
+            payload[self.reduced_ready : self.reduced_ready + 8].zero_()
         self.output = torch.empty(
             (config.m, k.H), dtype=torch.bfloat16, device=self.device
         )
-        self.comm, self.windows, bases = _register(
-            tp_group,
-            self.rank,
-            k.TP,
-            (*self.partials, *self.reduced_payloads, *self.reduced_scales),
+        self.comm, self.windows, (workspace_base,) = _register(
+            tp_group, self.rank, k.TP, (self.workspace,)
         )
+        bases = tuple(workspace_base + offset for offset in offsets)
         self.partial_bases = bases[: k.SLOTS]
         self.reduced_payload_bases = bases[k.SLOTS : 2 * k.SLOTS]
         self.reduced_scale_bases = bases[2 * k.SLOTS :]
@@ -603,6 +754,7 @@ class _PersistentWindowRunner:
 _RUNNER_TYPES = {
     atomic_compressed.Config: _AtomicCompressedRunner,
     full_width.Config: _FullWidthRunner,
+    owner_reduce_megakernel.OwnerMegaKernelConfig: _OwnerMegaKernelRunner,
     windowed.Config: _WindowedRunner,
     persistent_window.Config: _PersistentWindowRunner,
 }

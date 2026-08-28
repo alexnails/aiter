@@ -64,6 +64,10 @@ class CommFusedMoeRuntime:
             padded_shared[raw_tokens:].zero_()
             shared_partial = padded_shared
 
+        prepare_shared_partial = getattr(runner, "prepare_shared_partial", None)
+        if prepare_shared_partial is not None:
+            shared_partial = prepare_shared_partial(shared_partial)
+
         output = _fused_moe_impl(
             **moe_args,
             _stage2_override=functools.partial(
