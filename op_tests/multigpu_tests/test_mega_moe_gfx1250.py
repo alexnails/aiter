@@ -26,7 +26,7 @@ Launch (4x gfx1250; every env knob below is already the script's default):
       -q a4w4_mxfp4 -e 384 -k 6 -hd 7168 -id 3072 --layers 61 --combine base
     # Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip CCO JIT.
 
-Env / CLI: --layers --logits_tol --acc_verify --dispatch_commu_dtype --combine_quant -tpr -hd -id -e -k --shared_E -q
+Env / CLI: --layers --logits_tol --acc_verify --dispatch_dtype --combine_quant -tpr -hd -id -e -k --shared_E -q
 """
 
 import argparse
@@ -61,13 +61,13 @@ except Exception:  # noqa: BLE001 # pragma: no cover
 # (a4w4), 1 -> fp8 (a8w4). The weights are mxfp4 either way; -q only decides how
 # they are laid out. This pins a8w4; main() then drives it from the quant key.
 os.environ.setdefault("ENABLE_CK", "0")
-os.environ.setdefault("AITER_FORCE_A8W4", "1")
+os.environ.setdefault("AITER_FORCE_A8W4", "0")
 os.environ.setdefault("AITER_USE_GROUPED_GEMM", "1")
 os.environ.setdefault("AITER_BF16_FP8_MOE_BOUND", "0")
 # Both EP paths go through mori's HIP/JIT dispatch: MORI_V2_KERNEL_BACKEND picks
 # it for the `base` path's EpDispatchCombineOp, MEGA_DISPATCH for the dispatch
 # inside MegaMoEGfx1250. Same dispatch on both sides -> the kernel tables differ
-# only in the combine.
+# only in the combine.s
 os.environ.setdefault("MORI_V2_KERNEL_BACKEND", "hip")
 os.environ.setdefault("MEGA_DISPATCH", "mori")
 
@@ -104,13 +104,20 @@ def _import_mori_v2():
 # Config / quant-path spec
 def resolve_spec(quant_key, transport):
     """How to prepare weights / quantize activations / call fused_moe for a quant
-    key, plus the dispatch transport dtype. transport: auto|bf16|fp8."""
+    key, plus the dispatch transport dtype. transport: auto|bf16|fp8|fp4.
+
+    The transport keys are resolved but NOT yet wired into either pipeline -- see
+    --dispatch_dtype. A narrow transport only makes sense when the quant key
+    already carries activations in that format, so anything else falls back to
+    bf16 rather than silently mismatching the GEMM."""
     is_mxfp4 = quant_key in _MXFP4_KEYS
     is_fp8 = quant_key in _FP8_KEYS
 
     if transport == "auto":
         transport = "fp8" if is_fp8 else "bf16"
     if transport == "fp8" and not is_fp8:
+        transport = "bf16"
+    if transport == "fp4" and not is_mxfp4:
         transport = "bf16"
 
     if quant_key == "No":
@@ -135,7 +142,7 @@ def resolve_spec(quant_key, transport):
         "is_mxfp4": is_mxfp4,
         "is_fp8": is_fp8,
         "transport": transport,
-        "prequant": transport == "fp8",
+        "prequant": transport != "bf16",
         "fp8_dtype": _FP8_DTYPE,
     }
 
@@ -349,30 +356,6 @@ def _rmsnorm(x, eps=1e-6):
     return n.to(x.dtype)
 
 
-def _mx_wire_roundtrip(y, mode, block=32):
-    """Per-32 MX (e8m0 scale + narrow element) round-trip on one expert's
-    weighted contribution, mirroring what the mxfp8 / mxfp4 combine wire does on
-    device: the GEMM2 epilogue quantizes after applying the route weight, and
-    the combine kernel dequantizes before summing. Lets the reference isolate
-    wire-format loss from kernel bugs -- see --ref_combine_quant."""
-    shp = y.shape
-    v = y.reshape(-1, block).float()
-    amax = v.abs().amax(dim=1, keepdim=True)
-    fp8 = mode == "mxfp8"
-    mx_dt = fp4_utils.MxDtypeInt.FP8_E4M3 if fp8 else fp4_utils.MxDtypeInt.FP4_E2M1
-    e8m0 = fp4_utils.f32_to_mx_e8m0_scale(amax, dtype=mx_dt)
-    s = fp4_utils.e8m0_to_f32(e8m0).float()
-    n = v / s
-    if fp8:
-        q = n.to(torch.float8_e4m3fn).float()
-    else:
-        # e2m1 has no torch dtype, so the fp4 leg goes through the packed
-        # encode/decode pair, which rounds RNE and saturates at 6.0 like the
-        # device-side cvt_scalef32_pk8_fp4_f32.
-        q = fp4_utils.mxfp4_to_f32(fp4_utils.f32_to_mxfp4(n))
-    return (q * s).reshape(shp).to(y.dtype)
-
-
 def _calc_diff(x, y):
     """1 - cosine similarity (fp64), mirrors test_moe_ep.py::_calc_diff."""
     x, y = x.double(), y.double()
@@ -407,9 +390,8 @@ _ACC_TOL_SAFETY = 1.5
 # The table was calibrated with the mxfp8 wire; --combine_quant mxfp4 is NOT
 # covered by it. e2m1 keeps ~3 effective bits, so the wire alone costs several
 # times what fp8 does and will overshoot these numbers -- worst on a8w4, whose
-# baseline is small enough that the wire dominates it. Run mxfp4 with a matching
-# --ref_combine_quant mxfp4 (same round-trip in the reference, so what is left
-# is kernel error) or pin an explicit --logits_tol.
+# baseline is small enough that the wire dominates it. Pin an explicit
+# --logits_tol when running mxfp4.
 
 
 def default_logits_tol(quant_key, n_layers):
@@ -463,12 +445,11 @@ class RefModel:
     residual. Uses only torch + fp4_utils -- NO mori/cco/fused_moe. Runs in fp32
     on `dev`; for tractable memory/time use a modest token count for --check."""
 
-    def __init__(self, w1_bf, w2_bf, sw1, sw2, spec, dev, wire_quant="none"):
+    def __init__(self, w1_bf, w2_bf, sw1, sw2, spec, dev):
         self.w1_bf, self.w2_bf = w1_bf, w2_bf
         self.sw1, self.sw2 = sw1, sw2
         self.spec = spec
         self.dev = dev
-        self.wire_quant = wire_quant
         self._cache = {}
 
     def _expert(self, g):
@@ -512,10 +493,7 @@ class RefModel:
             rows = sel.any(dim=1)
             w = (wts * sel).sum(dim=1)
             w1d, w2d = self._expert(int(g))
-            contrib = w[rows, None] * self._ffn(xn[rows], w1d, w2d)
-            if self.wire_quant != "none":
-                contrib = _mx_wire_roundtrip(contrib, self.wire_quant)
-            out[rows] += contrib
+            out[rows] += w[rows, None] * self._ffn(xn[rows], w1d, w2d)
         return out + self._shared(xn)
 
     def run(self, x0, routings):
@@ -853,7 +831,7 @@ def main():
     args = _parse_args()
     dist_ctx = Dist()
     dev = torch.device("cuda", dist_ctx.local_rank)
-    spec = resolve_spec(args.quant_type, args.dispatch_commu_dtype)
+    spec = resolve_spec(args.quant_type, args.dispatch_dtype)
     # -q owns the activation dtype, so it wins over the module-level default.
     os.environ["AITER_FORCE_A8W4"] = "0" if args.quant_type == "a4w4_mxfp4" else "1"
 
@@ -979,9 +957,7 @@ def main():
         )
         tol_desc = f"{tol:.6f}{' auto' if auto_tol else ''}"
         out_dev = pipe.final_output().float()
-        ref = RefModel(
-            w1_bf, w2_bf, sw1, sw2, spec, dev, wire_quant=args.ref_combine_quant
-        )
+        ref = RefModel(w1_bf, w2_bf, sw1, sw2, spec, dev)
         ref_out = ref.run(x0, routings).float()
         logits_diff = _calc_diff(ref_out, out_dev)
         errs = dist_ctx.allreduce_sum(0 if logits_diff < tol else 1)
@@ -1053,11 +1029,13 @@ def _parse_args():
         "can stall multi-rank graph-profile runs)",
     )
     p.add_argument(
-        "--dispatch_commu_dtype",
+        "--dispatch_dtype",
         type=str,
-        choices=["auto", "bf16", "fp8"],
+        choices=["auto", "bf16", "fp8", "fp4"],
         default="auto",
-        help="dispatch transport (communication) dtype",
+        help="dispatch transport (communication) dtype. PLACEHOLDER: resolve_spec "
+        "resolves it but nothing consumes the result yet, so both pipelines still "
+        "transport bf16 whatever this says.",
     )
     p.add_argument(
         "--combine",
@@ -1075,15 +1053,6 @@ def _parse_args():
         help="combine wire dtype for the fused combine: none (bf16) | mxfp8 "
         "(fp8 e4m3 payload) | mxfp4 (fp4 e2m1 payload), both with a per-1x32 "
         "e8m0 scale plane. Falls back to $COMBINE_QUANT.",
-    )
-    p.add_argument(
-        "--ref_combine_quant",
-        type=str,
-        choices=["none", "mxfp8", "mxfp4"],
-        default="none",
-        help="apply the same combine wire quantization inside the fp32 reference. "
-        "Diagnostic only: matching it to --combine_quant separates wire-format "
-        "loss (expected) from kernel bugs (not expected).",
     )
     return p.parse_args()
 
