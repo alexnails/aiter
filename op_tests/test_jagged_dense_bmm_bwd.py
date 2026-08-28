@@ -236,7 +236,9 @@ def _build_flydsl_fn(jagged, dense, d_out, seq_offsets, B, Mi, N, K, component):
 
     if component == "jagged":
         dense_kn = dense.reshape(B * K, N).contiguous()
-        d_jagged = torch.zeros(total_rows + block_m, K, dtype=dtypes.bf16, device=device)
+        d_jagged = torch.zeros(
+            total_rows + block_m, K, dtype=dtypes.bf16, device=device
+        )
         t_dj = flyc.from_dlpack(d_jagged).mark_layout_dynamic(
             leading_dim=1, divisibility=8
         )
@@ -296,9 +298,9 @@ def jdbba_bwd(B, D, Kout, Mi, regime, component, seed=SEED, sparsity=0.95):
     for name, fn in candidates.items():
         got, us = run_perftest(fn)
         min_cos = _component_cos(component, got, ref)
-        assert min_cos > _COS_THRESH, (
-            f"{name}: jdbba_bwd ({component}, {regime}) cos={min_cos:.5f}"
-        )
+        assert (
+            min_cos > _COS_THRESH
+        ), f"{name}: jdbba_bwd ({component}, {regime}) cos={min_cos:.5f}"
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -495,10 +497,14 @@ def test_jdbba_bwd_reduce_path(D):
 
 def main(argv=None) -> int:
     if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning("jagged_dense_bmm_bwd unsupported on %s; skipping", get_gfx())
+        aiter.logger.warning(
+            "jagged_dense_bmm_bwd unsupported on %s; skipping", get_gfx()
+        )
         return 0
     if not _HAS_FLYDSL:
-        aiter.logger.warning("flydsl unavailable; skipping jagged_dense_bmm_bwd perf sweep")
+        aiter.logger.warning(
+            "flydsl unavailable; skipping jagged_dense_bmm_bwd perf sweep"
+        )
         return 0
     if not _HAS_TRITON:
         aiter.logger.warning(
@@ -571,7 +577,14 @@ def main(argv=None) -> int:
     ):
         rows.append(
             jdbba_bwd(
-                B, D, Kout, args.mi, regime, component, seed=args.seed, sparsity=args.sparsity
+                B,
+                D,
+                Kout,
+                args.mi,
+                regime,
+                component,
+                seed=args.seed,
+                sparsity=args.sparsity,
             )
         )
     _summarize("jagged_dense_bmm_bwd", rows)
