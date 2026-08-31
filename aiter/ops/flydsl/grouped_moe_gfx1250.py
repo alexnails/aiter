@@ -492,6 +492,15 @@ def _grouped_a8w4_tdm_moe(
     wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
     _align_m = max(tile_m, tile_m2)
+    # Both GEMMs walk the same contiguous layout, each with its own tile height,
+    # so every expert must start on a row that is a multiple of both. Aligning to
+    # the larger tile only achieves that when it is a multiple of the smaller one.
+    if _align_m % tile_m or _align_m % tile_m2:
+        raise ValueError(
+            f"[grouped-moe] tile_m={tile_m} and tile_m2={tile_m2} must both "
+            f"divide their max ({_align_m}); otherwise a GEMM tile straddles "
+            "two experts and silently computes against the wrong weights"
+        )
     contiguous_m = max(
         _align_m, _tdm_align_up(token_num * topk + E * _align_m - topk, _align_m)
     )
@@ -565,12 +574,16 @@ def _grouped_a8w4_tdm_moe(
             "max_tok": int(stage2_scatter.max_tokens_per_rank),
             "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
         }
+    # Align expert starts to the larger of the two tile heights: gemm2 may tile M
+    # more coarsely than gemm1 (it also runs the EP scatter, which shifts its
+    # optimum), and a start aligned only to tile_m would let a gemm2 tile cross an
+    # expert boundary.
     _starts, psum, _ = contiguous_psum_remap(
         _masked_m,
         topids_to_rows,
         E,
         max_m,
-        tile_m,
+        _align_m,
         num_valid_routes=_ep_nvr,
         ep_scatter_params=ep_scatter_params,
     )
