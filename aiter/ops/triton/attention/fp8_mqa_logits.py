@@ -225,6 +225,27 @@ def fp8_mqa_logits(
         BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
         use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
         use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
+
+        if arch == "gfx950" and block_m > 1 and not use_buffer_store and head_size > 64:
+            # Register-pressure escape hatch. Three things stack here: BLOCK_M=2
+            # keeps two rows' worth of values live, the global-store fallback
+            # adds the 64-bit address arithmetic that buffer_store folds into
+            # its descriptor, and waves_per_eu=4 caps each thread at a quarter
+            # of the register budget. Together they are infeasible, and the AMD
+            # backend does not report that -- it trips an LLVM assertion
+            # (`iota_range: Begin <= End`) inside make_amdgcn and aborts, so the
+            # caller sees SIGABRT rather than an exception.
+            #
+            # Relaxing the occupancy target is free on exactly the shapes that
+            # need it -- measured within noise of waves_per_eu=4 at
+            # [16384,32768] (2437 vs 2445 us), [8192,65536] (3164 vs 3160) and
+            # [16384,65536] (5794 vs 5798).
+            #
+            # head_size is part of the guard because it decides the fold layout:
+            # at 64 the same BLOCK_M/store combination compiles fine at
+            # waves_per_eu=4, and dropping to 2 there costs 24%. Widening this
+            # condition trades that away for nothing.
+            waves_per_eu = 2
         _gluon_fp8_mqa_logits_kernel[((seq_len + block_m - 1) // block_m,)](
             Q_ptr=Q,
             KV_ptr=KV,
